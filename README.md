@@ -17,7 +17,7 @@ Run: java -jar bazel-bin/gerrit.war init --batch --dev -d /tmp/gerrit-site
 
 To build the plugin, run: bazel build //plugins/multianchor_comment:multianchor_comment
 
-Copy the jar to the development directory: cp bazel-bin/plugins/multianchor_comment/multianchor_comment.jar /tmp/gerrit-site/plugins/
+Copy the jar to the development directory: sudo cp bazel-bin/plugins/multianchor_comment/multianchor_comment.jar /tmp/gerrit-site/plugins/
 
 # Start Gerrit
 
@@ -81,5 +81,13 @@ If you already had commits, use git commit --amend to ensure they all have a Cha
 Make a commit and push using: git push ssh://admin@localhost:29418/<repo-name> HEAD:refs/for/master
 
 Verify that you can see the commit in the Gerrit Web UI
+
+# Using the plugin
+
+Looking at a diff view for a commit, hold ctrl/cmd and select multiple (even non-adjacent) lines.
+
+Press 'c'
+
+You should see a "Draft - Multi-anchor: <selected lines>" comment box appear!
 
 
