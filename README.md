@@ -90,4 +90,10 @@ Press 'c'
 
 You should see a "Draft - Multi-anchor: <selected lines>" comment box appear!
 
+# Tips
 
+When you make an edit, you can rebuild, copy the jar to the development directory (use sudo), and then run the jar.
+
+Instead of looking up the URL each time, you can do ctrl/cmd + shift + R to hard reload the page.
+
+When done with Gerrit, do ctrl + C to properly shut Gerrit down (avoids lingering processes).
