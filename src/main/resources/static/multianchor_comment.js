@@ -38,7 +38,9 @@ Gerrit.install(plugin => {
       .multi-anchor-thread {
         cursor: pointer;
       }
+
     `;
+
     diffElement.appendChild(style);
   }
 
@@ -67,7 +69,7 @@ Gerrit.install(plugin => {
     tr.classList.add('multi-anchor-comment-row');
     tr.innerHTML = `
       <td colspan="2"></td>
-      <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color);">
+      <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color); overflow: hidden;">
         <div style="
           background-color: rgb(254, 247, 224);
           padding: var(--spacing-m);
@@ -75,6 +77,7 @@ Gerrit.install(plugin => {
           font-size: var(--font-size-normal, 1rem);
           display: flex;
           align-items: center;
+          overflow: hidden;
         ">
           <span style="color: var(--info-foreground);">✏</span>&nbsp;
           <span style="font-weight: var(--font-weight-medium);">Draft</span>
@@ -88,6 +91,7 @@ Gerrit.install(plugin => {
           font-family: var(--font-family), 'Roboto', Arial, sans-serif;
           font-size: var(--font-size-normal, 1rem);
           color: var(--primary-text-color);
+          overflow: hidden;
         ">
           <textarea class="multi-anchor-textarea" rows="4" placeholder="Mention others with @" style="
             display: block; margin-bottom: var(--spacing-m); width: 100%;
@@ -226,9 +230,12 @@ Gerrit.install(plugin => {
     // Remove all existing comment threads first
     table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
 
-    // Clear existing line markers
+    // Clear existing line markers (both anchored and highlighted)
     table.querySelectorAll('td.multi-anchor-existing').forEach(td => {
       td.classList.remove('multi-anchor-existing');
+    });
+    table.querySelectorAll('td.multi-anchor-highlighted').forEach(td => {
+      td.classList.remove('multi-anchor-highlighted');
     });
 
     // Display each saved comment
@@ -249,24 +256,51 @@ Gerrit.install(plugin => {
       tr.dataset.commentId = commentId;
       tr.innerHTML = `
         <td colspan="2"></td>
-        <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color);">
+        <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color); overflow: hidden;">
           <div style="
-            background-color: rgb(254, 247, 224);
+            background-color: ${resolved ? 'rgb(232, 245, 233)' : 'rgb(254, 247, 224)'};
             padding: var(--spacing-m);
             font-family: var(--font-family), 'Roboto', Arial, sans-serif;
             font-size: var(--font-size-normal, 1rem);
             color: rgb(32, 33, 35);
+            overflow: hidden; word-wrap: break-word;
           ">
             <div style="margin-bottom: var(--spacing-s);">
-              <strong>💬 Comment</strong> · Lines: ${lineLabels}
+              <strong>${resolved ? '✓' : '💬'} Comment</strong> · Lines: ${lineLabels}
+              ${resolved ? '<span style="color: rgb(56, 142, 60); font-size: 0.9em; margin-left: var(--spacing-s);">(Resolved)</span>' : ''}
             </div>
             <div style="white-space: pre-wrap;">
               ${escapeHtml(text)}
             </div>
-            ${resolved ? '<div style="margin-top: var(--spacing-s); font-weight: 500;">✓ Resolved</div>' : ''}
+            <div style="margin-top: var(--spacing-s); display: flex; gap: var(--spacing-s); justify-content: flex-end;">
+              <button class="ma-resolve-btn" style="
+                background: none; border: none; color: var(--link-color);
+                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
+                font-weight: var(--font-weight-medium);
+              ">${resolved ? 'Unresolve' : 'Resolve'}</button>
+              <button class="ma-discard-btn" style="
+                background: none; border: none; color: rgb(217, 48, 37);
+                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
+                font-weight: var(--font-weight-medium);
+              ">Discard</button>
+            </div>
           </div>
         </td>
       `;
+
+      // Resolve button handler
+      tr.querySelector('.ma-resolve-btn').addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        comment.resolved = !comment.resolved;
+        displaySavedComments(table);
+      });
+
+      // Discard button handler
+      tr.querySelector('.ma-discard-btn').addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        savedComments.delete(commentId);
+        displaySavedComments(table);
+      });
 
       // AC2: Add hover handlers to highlight associated lines (respects persistent toggle)
       tr.addEventListener('mouseenter', () => {
@@ -374,7 +408,15 @@ Gerrit.install(plugin => {
     });
 
     document.addEventListener('keydown', function (e) {
-      if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
+      // Block if typing in any text field (check both target and active element)
+      const tag = e.target.tagName;
+      const activeTag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'TEXTAREA' || tag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'INPUT') {
+        return;
+      }
+
+      // Also block if a comment box is already open
+      if (e.key === 'c' && table.querySelector('tr.multi-anchor-comment-row')) {
         return;
       }
 
