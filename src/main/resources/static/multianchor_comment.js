@@ -1,227 +1,398 @@
 Gerrit.install(plugin => {
 
-console.log('[multianchor-comment] JS loaded');
+  console.log('[multianchor-comment] JS loaded');
 
-function injectStyles(diffElement) {
-  const style = document.createElement('style');
-  style.textContent = `
-    td.multi-anchor-selected div.contentText {
-      background-color: rgba(255, 200, 0, 0.3) !important;
+  // In-memory storage for multi-anchor comments
+  const savedComments = new Map();
+  let commentIdCounter = 1;
+
+  function injectStyles(diffElement) {
+    const style = document.createElement('style');
+    style.textContent = `
+      td.multi-anchor-selected div.contentText {
+        background-color: rgba(255, 200, 0, 0.3) !important;
+      }
+      td.multi-anchor-selected button.lineNumButton {
+        background-color: rgba(255, 200, 0, 0.3) !important;
+      }
+
+      /* AC1: Visual indicators for anchored lines */
+      td.multi-anchor-existing div.contentText {
+        border-left: 3px solid rgb(25, 103, 210) !important;
+        background-color: rgba(66, 133, 244, 0.12) !important;
+      }
+      td.multi-anchor-existing button.lineNumButton {
+        background-color: rgba(66, 133, 244, 0.15) !important;
+      }
+
+      /* AC2: Highlighted state for hover/click */
+      td.multi-anchor-highlighted div.contentText {
+        background-color: rgba(66, 133, 244, 0.35) !important;
+        border-left: 3px solid rgb(25, 103, 210) !important;
+      }
+      td.multi-anchor-highlighted button.lineNumButton {
+        background-color: rgba(66, 133, 244, 0.35) !important;
+      }
+
+      /* Comment thread styling */
+      .multi-anchor-thread {
+        cursor: pointer;
+      }
+    `;
+    diffElement.appendChild(style);
+  }
+
+  const selectedLines = new Set();
+
+  function toggleLine(lineKey, side, row) {
+    if (selectedLines.has(lineKey)) {
+      selectedLines.delete(lineKey);
+      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.remove('multi-anchor-selected'));
     }
-    td.multi-anchor-selected button.lineNumButton {
-      background-color: rgba(255, 200, 0, 0.3) !important;
+    else {
+      selectedLines.add(lineKey);
+      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.add('multi-anchor-selected'));
     }
-  `;
-  diffElement.appendChild(style);
-}
-
-const selectedLines = new Set();
-
-function toggleLine(lineKey, side, row) {
-  if (selectedLines.has(lineKey)) {
-    selectedLines.delete(lineKey);
-    row.querySelectorAll(`td.${side}`).forEach(td => td.classList.remove('multi-anchor-selected'));
-  }
-  else {
-    selectedLines.add(lineKey);
-    row.querySelectorAll(`td.${side}`).forEach(td => td.classList.add('multi-anchor-selected'));
-  }
-}
-
-function showCommentBox(table, selectedLines) {
-  const existing = table.querySelector('tr.multi-anchor-comment-row');
-  if (existing) {
-    existing.remove();
   }
 
-  const lineLabels = [...selectedLines].join(', ');
+  function showCommentBox(table, selectedLines) {
+    const existing = table.querySelector('tr.multi-anchor-comment-row');
+    if (existing) {
+      existing.remove();
+    }
 
-  const tr = document.createElement('tr');
-  tr.classList.add('multi-anchor-comment-row');
-  tr.innerHTML = `
-    <td colspan="2"></td>
-    <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color);">
-      <div style="
-        background-color: rgb(254, 247, 224);
-        padding: var(--spacing-m);
-        font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-        font-size: var(--font-size-normal, 1rem);
-        display: flex;
-        align-items: center;
-      ">
-        <span style="color: var(--info-foreground);">✏</span>&nbsp;
-        <span style="font-weight: var(--font-weight-medium);">Draft</span>
-        <span style="color: var(--deemphasized-text-color); margin-left: var(--spacing-s); font-weight: normal;">
-          · Multi-anchor: ${lineLabels}
-        </span>
-      </div>
-      <div style="
-        background-color: rgb(254, 247, 224);
-        padding: var(--spacing-m);
-        font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-        font-size: var(--font-size-normal, 1rem);
-        color: var(--primary-text-color);
-      ">
-        <textarea class="multi-anchor-textarea" rows="4" placeholder="Mention others with @" style="
-          display: block; margin-bottom: var(--spacing-m); width: 100%;
-          box-sizing: border-box; font: inherit;
-          background-color: white;
-          border: 1px solid var(--border-color);
-          border-radius: var(--border-radius);
+    const lineLabels = [...selectedLines].join(', ');
+
+    const tr = document.createElement('tr');
+    tr.classList.add('multi-anchor-comment-row');
+    tr.innerHTML = `
+      <td colspan="2"></td>
+      <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color);">
+        <div style="
+          background-color: rgb(254, 247, 224);
+          padding: var(--spacing-m);
+          font-family: var(--font-family), 'Roboto', Arial, sans-serif;
+          font-size: var(--font-size-normal, 1rem);
+          display: flex;
+          align-items: center;
+        ">
+          <span style="color: var(--info-foreground);">✏</span>&nbsp;
+          <span style="font-weight: var(--font-weight-medium);">Draft</span>
+          <span style="color: var(--deemphasized-text-color); margin-left: var(--spacing-s); font-weight: normal;">
+            · Multi-anchor: ${lineLabels}
+          </span>
+        </div>
+        <div style="
+          background-color: rgb(254, 247, 224);
+          padding: var(--spacing-m);
+          font-family: var(--font-family), 'Roboto', Arial, sans-serif;
+          font-size: var(--font-size-normal, 1rem);
           color: var(--primary-text-color);
-          padding: var(--spacing-s);
-        "></textarea>
-        <div style="display: flex; justify-content: space-between; user-select: none;">
-          <div style="display: flex; align-items: center; flex: 1;">
-            <label style="display: flex; align-items: center; color: var(--comment-text-color);">
-              <input type="checkbox" class="multi-anchor-resolved" style="margin-right: var(--spacing-s);"> Resolved
-            </label>
-          </div>
-          <div style="display: flex;">
-            <button class="multi-anchor-cancel" style="
-              background: none; border: none; color: var(--link-color);
-              cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-              font-weight: var(--font-weight-medium);
-            ">Cancel</button>
-            <button class="multi-anchor-save" style="
-              background: none; border: none; color: var(--link-color);
-              cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-              font-weight: var(--font-weight-medium);
-            ">Save</button>
+        ">
+          <textarea class="multi-anchor-textarea" rows="4" placeholder="Mention others with @" style="
+            display: block; margin-bottom: var(--spacing-m); width: 100%;
+            box-sizing: border-box; font: inherit;
+            background-color: white;
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius);
+            color: rgb(32, 33, 35);
+            padding: var(--spacing-s);
+          "></textarea>
+          <div style="display: flex; justify-content: space-between; user-select: none;">
+            <div style="display: flex; align-items: center; flex: 1;">
+              <label style="display: flex; align-items: center; color: var(--comment-text-color);">
+                <input type="checkbox" class="multi-anchor-resolved" style="margin-right: var(--spacing-s);"> Resolved
+              </label>
+            </div>
+            <div style="display: flex;">
+              <button class="multi-anchor-cancel" style="
+                background: none; border: none; color: var(--link-color);
+                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
+                font-weight: var(--font-weight-medium);
+              ">Cancel</button>
+              <button class="multi-anchor-save" style="
+                background: none; border: none; color: var(--link-color);
+                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
+                font-weight: var(--font-weight-medium);
+              ">Save</button>
+            </div>
           </div>
         </div>
-      </div>
-    </td>
-  `;
+      </td>
+    `;
 
-  // insert after last
-  const lastLineKey = [...selectedLines][selectedLines.size - 1];
-  const [side, lineNum] = lastLineKey.split('-');
-  const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-  if (lastRow) {
-    lastRow.insertAdjacentElement('afterend', tr);
-  }
-  else {
-    table.appendChild(tr);
-  }
-
-  tr.querySelector('.multi-anchor-save').addEventListener('click', () => {
-    const text = tr.querySelector('.multi-anchor-textarea').value;
-    console.log('Multi-anchor comment saved:', {
-      lines: [...selectedLines],
-      comment: text
-    });
-    tr.remove();
-    clearSelection(table);
-  });
-
-  tr.querySelector('.multi-anchor-cancel').addEventListener('click', () => {
-    tr.remove();
-    clearSelection(table);
-  });
-
-  tr.querySelector('.multi-anchor-textarea').focus();
-}
-
-function clearSelection(table) {
-  selectedLines.clear();
-  table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
-    el.style.backgroundColor = '';
-  });
-  table.querySelectorAll('td.multi-anchor-selected button.lineNumButton').forEach(el => {
-    el.style.backgroundColor = '';
-  });
-  table.querySelectorAll('td.multi-anchor-selected').forEach(td => {
-    td.classList.remove('multi-anchor-selected');
-  });
-}
-
-function getDiffElement() {
-  try {
-    return document.querySelector('gr-app').shadowRoot
-      .querySelector('gr-app-element').shadowRoot
-      .querySelector('gr-diff-view').shadowRoot
-      .querySelector('gr-diff-host').shadowRoot
-      .querySelector('gr-diff').shadowRoot
-      .querySelector('gr-diff-element');
-  }
-  catch(e) {
-    return null;
-  }
-}
-
-function attachListeners() {
-  const diffElement = getDiffElement();
-  if (!diffElement) {
-    setTimeout(attachListeners, 500);
-    return;
-  }
-
-  injectStyles(diffElement);
-
-  const table = diffElement.querySelector('table#diffTable');
-  if (!table) {
-    setTimeout(attachListeners, 500);
-    return;
-  }
-
-  table.addEventListener('click', function(e) {
-    if (!e.ctrlKey && !e.metaKey) {
-      return;
+    // insert after last
+    const lastLineKey = [...selectedLines][selectedLines.size - 1];
+    const [side, lineNum] = lastLineKey.split('-');
+    const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+    if (lastRow) {
+      lastRow.insertAdjacentElement('afterend', tr);
+    }
+    else {
+      table.appendChild(tr);
     }
 
-    const row = e.target.closest('tr');
-    if (!row) {
-      return;
-    }
+    tr.querySelector('.multi-anchor-save').addEventListener('click', () => {
+      const text = tr.querySelector('.multi-anchor-textarea').value;
+      const resolved = tr.querySelector('.multi-anchor-resolved').checked;
 
-    const isRight = e.target.closest('td.right') !== null;
-    const isLeft = e.target.closest('td.left') !== null;
-    if (!isRight && !isLeft) {
-      return;
-    }
-
-    const side = isRight ? 'right' : 'left';
-
-    const lineNumCell = row.querySelector(`td.${side}.lineNum`);
-
-    if (!lineNumCell) {
-      return;
-    }
-
-    const lineNum = lineNumCell.dataset.value;
-    if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE')  {
-      return;
-    }
-
-    const lineKey = `${side}-${lineNum}`;
-    toggleLine(lineKey, side, row);
-
-    console.log('Selected lines:', [...selectedLines]);
-    e.preventDefault();
-    e.stopPropagation();
-  });
-
-  document.addEventListener('keydown', function(e) {
-    if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
-      return;
-    }
-
-    if (e.key === 'c' && selectedLines.size > 0) {
-      console.log('c pressed, showing multi-anchor box');
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      showCommentBox(table, selectedLines);
-    }
-    if (e.key === 'Escape') {
-      const existing = table.querySelector('tr.multi-anchor-comment-row');
-      if (existing) {
-        existing.remove();
-        clearSelection(table);
+      if (!text.trim()) {
+        return;
       }
+
+      // Save to in-memory storage
+      const commentId = `comment-${commentIdCounter++}`;
+      savedComments.set(commentId, {
+        lines: [...selectedLines],
+        text: text,
+        resolved: resolved
+      });
+
+      console.log('Multi-anchor comment saved:', savedComments.get(commentId));
+
+      tr.remove();
+      clearSelection(table);
+
+      // Display the saved comment with AC1, AC2, AC3 handlers
+      displaySavedComments(table);
+    });
+
+    tr.querySelector('.multi-anchor-cancel').addEventListener('click', () => {
+      tr.remove();
+      clearSelection(table);
+    });
+
+    tr.querySelector('.multi-anchor-textarea').focus();
+  }
+
+  function clearSelection(table) {
+    selectedLines.clear();
+    table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
+      el.style.backgroundColor = '';
+    });
+    table.querySelectorAll('td.multi-anchor-selected button.lineNumButton').forEach(el => {
+      el.style.backgroundColor = '';
+    });
+    table.querySelectorAll('td.multi-anchor-selected').forEach(td => {
+      td.classList.remove('multi-anchor-selected');
+    });
+  }
+
+  // AC1: Mark all anchored lines with visual indicators  
+  function markAnchoredLines(table, lines) {
+    lines.forEach(lineKey => {
+      const [side, lineNum] = lineKey.split('-');
+      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      if (row) {
+        row.querySelectorAll(`td.${side}`).forEach(td => {
+          td.classList.add('multi-anchor-existing');
+        });
+      }
+    });
+  }
+
+  // AC2: Highlight lines associated with a comment on hover/click
+  function highlightCommentLines(table, lines) {
+    lines.forEach(lineKey => {
+      const [side, lineNum] = lineKey.split('-');
+      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      if (row) {
+        row.querySelectorAll(`td.${side}`).forEach(td => {
+          td.classList.add('multi-anchor-highlighted');
+        });
+      }
+    });
+  }
+
+  function unhighlightCommentLines(table, lines) {
+    lines.forEach(lineKey => {
+      const [side, lineNum] = lineKey.split('-');
+      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      if (row) {
+        row.querySelectorAll(`td.${side}`).forEach(td => {
+          td.classList.remove('multi-anchor-highlighted');
+        });
+      }
+    });
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function displaySavedComments(table) {
+    // Remove all existing comment threads first
+    table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
+
+    // Clear existing line markers
+    table.querySelectorAll('td.multi-anchor-existing').forEach(td => {
+      td.classList.remove('multi-anchor-existing');
+    });
+
+    // Display each saved comment
+    savedComments.forEach((comment, commentId) => {
+      const { lines, text, resolved } = comment;
+
+      // AC1: Mark all anchored lines
+      markAnchoredLines(table, lines);
+
+      // Create comment thread element
+      const lineLabels = lines.map(lk => {
+        const [side, num] = lk.split('-');
+        return `${side === 'left' ? 'L' : 'R'}${num}`;
+      }).join(', ');
+
+      const tr = document.createElement('tr');
+      tr.classList.add('multi-anchor-thread');
+      tr.dataset.commentId = commentId;
+      tr.innerHTML = `
+        <td colspan="2"></td>
+        <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color);">
+          <div style="
+            background-color: rgb(254, 247, 224);
+            padding: var(--spacing-m);
+            font-family: var(--font-family), 'Roboto', Arial, sans-serif;
+            font-size: var(--font-size-normal, 1rem);
+            color: rgb(32, 33, 35);
+          ">
+            <div style="margin-bottom: var(--spacing-s);">
+              <strong>💬 Comment</strong> · Lines: ${lineLabels}
+            </div>
+            <div style="white-space: pre-wrap;">
+              ${escapeHtml(text)}
+            </div>
+            ${resolved ? '<div style="margin-top: var(--spacing-s); font-weight: 500;">✓ Resolved</div>' : ''}
+          </div>
+        </td>
+      `;
+
+      // AC2: Add hover handlers to highlight associated lines (respects persistent toggle)
+      tr.addEventListener('mouseenter', () => {
+        highlightCommentLines(table, lines);
+      });
+
+      tr.addEventListener('mouseleave', () => {
+        // Only unhighlight if NOT persistently toggled on
+        if (!tr.classList.contains('active-highlight')) {
+          unhighlightCommentLines(table, lines);
+        }
+      });
+
+      // AC3: Click to toggle persistent highlight
+      tr.addEventListener('click', () => {
+        const isHighlighted = tr.classList.contains('active-highlight');
+        if (isHighlighted) {
+          tr.classList.remove('active-highlight');
+          unhighlightCommentLines(table, lines);
+        } else {
+          tr.classList.add('active-highlight');
+          highlightCommentLines(table, lines);
+        }
+      });
+
+      // Insert after the last anchored line
+      const lastLineKey = lines[lines.length - 1];
+      const [side, lineNum] = lastLineKey.split('-');
+      const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      if (lastRow) {
+        lastRow.insertAdjacentElement('afterend', tr);
+      } else {
+        table.appendChild(tr);
+      }
+    });
+  }
+
+  function getDiffElement() {
+    try {
+      return document.querySelector('gr-app').shadowRoot
+        .querySelector('gr-app-element').shadowRoot
+        .querySelector('gr-diff-view').shadowRoot
+        .querySelector('gr-diff-host').shadowRoot
+        .querySelector('gr-diff').shadowRoot
+        .querySelector('gr-diff-element');
     }
-  }, true);
-}
+    catch (e) {
+      return null;
+    }
+  }
+
+  function attachListeners() {
+    const diffElement = getDiffElement();
+    if (!diffElement) {
+      setTimeout(attachListeners, 500);
+      return;
+    }
+
+    injectStyles(diffElement);
+
+    const table = diffElement.querySelector('table#diffTable');
+    if (!table) {
+      setTimeout(attachListeners, 500);
+      return;
+    }
+
+    // Display any saved comments on initial load
+    displaySavedComments(table);
+
+    table.addEventListener('click', function (e) {
+      if (!e.ctrlKey && !e.metaKey) {
+        return;
+      }
+
+      const row = e.target.closest('tr');
+      if (!row) {
+        return;
+      }
+
+      const isRight = e.target.closest('td.right') !== null;
+      const isLeft = e.target.closest('td.left') !== null;
+      if (!isRight && !isLeft) {
+        return;
+      }
+
+      const side = isRight ? 'right' : 'left';
+
+      const lineNumCell = row.querySelector(`td.${side}.lineNum`);
+
+      if (!lineNumCell) {
+        return;
+      }
+
+      const lineNum = lineNumCell.dataset.value;
+      if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE') {
+        return;
+      }
+
+      const lineKey = `${side}-${lineNum}`;
+      toggleLine(lineKey, side, row);
+
+      console.log('Selected lines:', [...selectedLines]);
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    document.addEventListener('keydown', function (e) {
+      if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
+        return;
+      }
+
+      if (e.key === 'c' && selectedLines.size > 0) {
+        console.log('c pressed, showing multi-anchor box');
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        showCommentBox(table, selectedLines);
+      }
+      if (e.key === 'Escape') {
+        const existing = table.querySelector('tr.multi-anchor-comment-row');
+        if (existing) {
+          existing.remove();
+          clearSelection(table);
+        }
+      }
+    }, true);
+  }
 
   setTimeout(attachListeners, 1000);
 });
