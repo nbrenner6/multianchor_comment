@@ -2,9 +2,290 @@ Gerrit.install(plugin => {
 
   console.log('[multianchor-comment] JS loaded');
 
-  // In-memory storage for multi-anchor comments
+  // Get the plugin's REST API helper
+  const restApi = plugin.restApi();
+
+  // In-memory cache for multi-anchor comments (synced with backend)
   const savedComments = new Map();
-  let commentIdCounter = 1;
+
+  /**
+   * Gets the current change number from the URL.
+   * URL format: /c/PROJECT/+/CHANGE_NUMBER/[PATCHSET]/[FILE]
+   */
+  function getChangeNumber() {
+    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/(\d+)/);
+    return match ? match[1] : null;
+  }
+
+  /**
+   * Gets the current patchset number from the URL.
+   */
+  function getPatchSetNumber() {
+    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/(\d+)/);
+    return match ? match[1] : 'current';
+  }
+
+  /**
+   * Gets the current file path from the URL.
+   */
+  function getFilePath() {
+    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/\d+\/(.+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  /**
+   * Converts selected line keys to Comment.Range format.
+   * @param {Set<string>} lineKeys - Set of "side-lineNum" strings
+   * @param {string} side - "left" or "right" to filter by
+   * @returns {Array<Range>} Array of range objects
+   */
+  function lineKeysToRanges(lineKeys, side) {
+    const lineNums = [...lineKeys]
+      .filter(key => key.startsWith(side))
+      .map(key => parseInt(key.split('-')[1], 10))
+      .sort((a, b) => a - b);
+
+    if (lineNums.length === 0) return [];
+
+    // Group consecutive lines into ranges
+    const ranges = [];
+    let rangeStart = lineNums[0];
+    let rangeEnd = lineNums[0];
+
+    for (let i = 1; i < lineNums.length; i++) {
+      if (lineNums[i] === rangeEnd + 1) {
+        rangeEnd = lineNums[i];
+      } else {
+        ranges.push({
+          startLine: rangeStart,
+          startCharacter: 0,
+          endLine: rangeEnd,
+          endCharacter: 0
+        });
+        rangeStart = lineNums[i];
+        rangeEnd = lineNums[i];
+      }
+    }
+    ranges.push({
+      startLine: rangeStart,
+      startCharacter: 0,
+      endLine: rangeEnd,
+      endCharacter: 0
+    });
+
+    return ranges;
+  }
+
+  /**
+   * Creates a draft comment via Gerrit's native API.
+   * Note: Gerrit uses PUT (not POST) to create draft comments.
+   * For whole-line selections, we only send 'line' (no range).
+   * @returns {Promise<Object>} The created comment info
+   */
+  async function createDraft(changeNum, patchSet, path, range, message) {
+    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
+
+    // For whole-line selections (startChar=0, endChar=0), don't send a range
+    // Just use the line number like native Gerrit comments
+    const body = {
+      path: path,
+      line: range.endLine,
+      message: message
+    };
+
+    console.log('[multianchor] Creating draft:', endpoint);
+    console.log('[multianchor] Request body:', JSON.stringify(body, null, 2));
+    return restApi.put(endpoint, body);
+  }
+
+  /**
+   * Deletes a draft comment via Gerrit's native API.
+   */
+  async function deleteDraft(changeNum, patchSet, draftId) {
+    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`;
+    console.log('[multianchor] Deleting draft:', endpoint);
+    return restApi.delete(endpoint);
+  }
+
+  /**
+   * Saves additional ranges for a comment via plugin API.
+   */
+  async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+    const body = { ranges: ranges };
+    console.log('[multianchor] Saving additional ranges:', endpoint, body);
+    return restApi.put(endpoint, body);
+  }
+
+  /**
+   * Gets additional ranges for a comment via plugin API.
+   */
+  async function getAdditionalRanges(changeNum, commentUuid) {
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+    return restApi.get(endpoint);
+  }
+
+  /**
+   * Deletes additional ranges for a comment via plugin API.
+   */
+  async function deleteAdditionalRanges(changeNum, commentUuid) {
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+    console.log('[multianchor] Deleting additional ranges:', endpoint);
+    return restApi.delete(endpoint);
+  }
+
+  /**
+   * Gets all additional ranges for a change via plugin API.
+   */
+  async function getAllAdditionalRanges(changeNum) {
+    const endpoint = `/changes/${changeNum}/multianchor-ranges`;
+    return restApi.get(endpoint);
+  }
+
+  /**
+   * Loads all drafts and their additional ranges.
+   */
+  async function loadMultiAnchorComments(changeNum, patchSet) {
+    try {
+      // Get all drafts from Gerrit
+      const draftsEndpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
+      const drafts = await restApi.get(draftsEndpoint);
+
+      // Get all additional ranges from plugin
+      const additionalRanges = await getAllAdditionalRanges(changeNum);
+
+      console.log('[multianchor] Loaded drafts:', drafts);
+      console.log('[multianchor] Loaded additional ranges:', additionalRanges);
+
+      // Clear and rebuild cache
+      savedComments.clear();
+
+      // Process drafts - drafts is a map of path -> array of comments
+      for (const [path, comments] of Object.entries(drafts || {})) {
+        for (const comment of comments) {
+          const uuid = comment.id;
+          const extraRanges = additionalRanges[uuid] || [];
+
+          // Only include comments that have additional ranges (multi-anchor)
+          if (extraRanges.length > 0) {
+            // Combine primary range with additional ranges
+            const allRanges = comment.range ? [comment.range, ...extraRanges] : extraRanges;
+
+            // Convert ranges to line keys for UI
+            const lines = allRanges.flatMap(range => {
+              const lineKeys = [];
+              for (let line = range.startLine; line <= range.endLine; line++) {
+                lineKeys.push(`right-${line}`);  // Assuming right side for now
+              }
+              return lineKeys;
+            });
+
+            savedComments.set(uuid, {
+              id: uuid,
+              path: path,
+              lines: lines,
+              text: comment.message,
+              resolved: comment.unresolved === false,
+              primaryRange: comment.range,
+              additionalRanges: extraRanges
+            });
+          }
+        }
+      }
+
+      console.log('[multianchor] Cached comments:', savedComments);
+      return savedComments;
+    } catch (error) {
+      console.error('[multianchor] Error loading comments:', error);
+      return savedComments;
+    }
+  }
+
+  /**
+   * Creates a multi-anchor comment (draft + additional ranges).
+   */
+  async function createMultiAnchorComment(selectedLines, message, resolved) {
+    const changeNum = getChangeNumber();
+    const patchSet = getPatchSetNumber();
+    const path = getFilePath();
+
+    if (!changeNum || !path) {
+      console.error('[multianchor] Cannot determine change or file path');
+      return null;
+    }
+
+    // Determine which side has the most selections
+    const rightLines = [...selectedLines].filter(k => k.startsWith('right'));
+    const leftLines = [...selectedLines].filter(k => k.startsWith('left'));
+    const side = rightLines.length >= leftLines.length ? 'right' : 'left';
+
+    // Convert line selections to ranges
+    const allRanges = lineKeysToRanges(selectedLines, side);
+
+    if (allRanges.length === 0) {
+      console.error('[multianchor] No valid ranges selected');
+      return null;
+    }
+
+    try {
+      // 1. Create draft with primary (first) range via Gerrit API
+      const primaryRange = allRanges[0];
+      const draft = await createDraft(changeNum, patchSet, path, primaryRange, message);
+
+      console.log('[multianchor] Created draft:', draft);
+
+      // 2. If there are additional ranges, save them via plugin API
+      if (allRanges.length > 1) {
+        const additionalRanges = allRanges.slice(1);
+        await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
+      }
+
+      // 3. Add to local cache
+      savedComments.set(draft.id, {
+        id: draft.id,
+        path: path,
+        lines: [...selectedLines],
+        text: message,
+        resolved: resolved,
+        primaryRange: primaryRange,
+        additionalRanges: allRanges.slice(1)
+      });
+
+      return draft;
+    } catch (error) {
+      console.error('[multianchor] Error creating comment:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Deletes a multi-anchor comment (draft + additional ranges).
+   */
+  async function deleteMultiAnchorComment(commentId) {
+    const changeNum = getChangeNumber();
+    const patchSet = getPatchSetNumber();
+
+    if (!changeNum) {
+      console.error('[multianchor] Cannot determine change number');
+      return false;
+    }
+
+    try {
+      // 1. Delete additional ranges from plugin storage
+      await deleteAdditionalRanges(changeNum, commentId);
+
+      // 2. Delete draft from Gerrit
+      await deleteDraft(changeNum, patchSet, commentId);
+
+      // 3. Remove from local cache
+      savedComments.delete(commentId);
+
+      return true;
+    } catch (error) {
+      console.error('[multianchor] Error deleting comment:', error);
+      return false;
+    }
+  }
 
   function injectStyles(diffElement) {
     const style = document.createElement('style');
@@ -136,7 +417,7 @@ Gerrit.install(plugin => {
       table.appendChild(tr);
     }
 
-    tr.querySelector('.multi-anchor-save').addEventListener('click', () => {
+    tr.querySelector('.multi-anchor-save').addEventListener('click', async () => {
       const text = tr.querySelector('.multi-anchor-textarea').value;
       const resolved = tr.querySelector('.multi-anchor-resolved').checked;
 
@@ -144,21 +425,31 @@ Gerrit.install(plugin => {
         return;
       }
 
-      // Save to in-memory storage
-      const commentId = `comment-${commentIdCounter++}`;
-      savedComments.set(commentId, {
-        lines: [...selectedLines],
-        text: text,
-        resolved: resolved
-      });
+      // Disable buttons while saving
+      tr.querySelector('.multi-anchor-save').disabled = true;
+      tr.querySelector('.multi-anchor-save').textContent = 'Saving...';
 
-      console.log('Multi-anchor comment saved:', savedComments.get(commentId));
+      try {
+        // Save to backend via REST API
+        const draft = await createMultiAnchorComment(selectedLines, text, resolved);
 
-      tr.remove();
-      clearSelection(table);
+        if (draft) {
+          console.log('[multianchor] Comment saved:', draft);
+          tr.remove();
+          clearSelection(table);
 
-      // Display the saved comment with AC1, AC2, AC3 handlers
-      displaySavedComments(table);
+          // Display the saved comment with AC1, AC2, AC3 handlers
+          displaySavedComments(table);
+        } else {
+          console.error('[multianchor] Failed to save comment');
+          tr.querySelector('.multi-anchor-save').disabled = false;
+          tr.querySelector('.multi-anchor-save').textContent = 'Save';
+        }
+      } catch (error) {
+        console.error('[multianchor] Error saving comment:', error);
+        tr.querySelector('.multi-anchor-save').disabled = false;
+        tr.querySelector('.multi-anchor-save').textContent = 'Save';
+      }
     });
 
     tr.querySelector('.multi-anchor-cancel').addEventListener('click', () => {
@@ -296,10 +587,27 @@ Gerrit.install(plugin => {
       });
 
       // Discard button handler
-      tr.querySelector('.ma-discard-btn').addEventListener('click', (ev) => {
+      tr.querySelector('.ma-discard-btn').addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        savedComments.delete(commentId);
-        displaySavedComments(table);
+
+        const btn = tr.querySelector('.ma-discard-btn');
+        btn.disabled = true;
+        btn.textContent = 'Deleting...';
+
+        try {
+          const success = await deleteMultiAnchorComment(commentId);
+          if (success) {
+            console.log('[multianchor] Comment deleted:', commentId);
+            displaySavedComments(table);
+          } else {
+            btn.disabled = false;
+            btn.textContent = 'Discard';
+          }
+        } catch (error) {
+          console.error('[multianchor] Error deleting comment:', error);
+          btn.disabled = false;
+          btn.textContent = 'Discard';
+        }
       });
 
       // AC2: Add hover handlers to highlight associated lines (respects persistent toggle)
@@ -367,8 +675,14 @@ Gerrit.install(plugin => {
       return;
     }
 
-    // Display any saved comments on initial load
-    displaySavedComments(table);
+    // Load and display comments from backend on initial load
+    const changeNum = getChangeNumber();
+    const patchSet = getPatchSetNumber();
+    if (changeNum) {
+      loadMultiAnchorComments(changeNum, patchSet).then(() => {
+        displaySavedComments(table);
+      });
+    }
 
     table.addEventListener('click', function (e) {
       if (!e.ctrlKey && !e.metaKey) {
