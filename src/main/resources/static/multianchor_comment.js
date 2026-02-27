@@ -6,6 +6,19 @@ Gerrit.install(plugin => {
   const savedComments = new Map();
   let commentIdCounter = 1;
 
+
+  /**
+   * Injects CSS styles into the Gerrit diff element that are specific to the
+   * multi-anchor comment plug-in
+   * 
+   * This function appends a <style> tag to the diffElement that is provided
+   * in the function call.
+   * 
+   * Styles rely on Gerrit's slass names and table structure.
+   * 
+   * @param {HTMLElement} diffElement 
+   * @returns {void}
+   */
   function injectStyles(diffElement) {
     const style = document.createElement('style');
     style.textContent = `
@@ -46,6 +59,20 @@ Gerrit.install(plugin => {
 
   const selectedLines = new Set();
 
+  /** 
+   * Toggles the selected state for a specific diff line in a multi-anchor 
+   * comment
+   * 
+   * If the lineKey has already been selected, it updates the global variable,
+   * selectedLinesSet, removing it. It also updates the corresponding table cells,
+   * removing the selected class. If the lineKey has NOT already been selected,
+   * this function adds its corresponding lineKey and gives it the selected styling.
+   * 
+   * @param {string} lineKey - unique ID for a line, uses the format "side-lineNum"
+   * @param {"left" | "right"} side - denotes the side of the diff the line is on
+   * @param {HTMLTableRowElement} row - the row element representing the line in the diff
+   * @returns {void}
+   */
   function toggleLine(lineKey, side, row) {
     if (selectedLines.has(lineKey)) {
       selectedLines.delete(lineKey);
@@ -57,6 +84,17 @@ Gerrit.install(plugin => {
     }
   }
 
+  /**
+   * Creates, inserts, and does the rendering for a multi-anchor comment draft box
+   * in the diff table. It places the box after the last selected line, and also 
+   * presents the textarea for the comment body, the checkbox for toggling the
+   * resolved state, and the buttons for canceling and saving the comment.
+   * 
+   * @param {HTMLTableElement} table - the Gerrit diff table
+   * @param {Set<String>} selectedLines - set of line keys that are currently 
+   * selected
+   * @returns {void}
+   */
   function showCommentBox(table, selectedLines) {
     const existing = table.querySelector('tr.multi-anchor-comment-row');
     if (existing) {
@@ -169,6 +207,16 @@ Gerrit.install(plugin => {
     tr.querySelector('.multi-anchor-textarea').focus();
   }
 
+  /**
+   * Clears all of the currerntly selected lines, removing the visual indicators
+   * of selection as well.
+   * 
+   * This function empties the selectedLines Set, and removes inline styling 
+   * that was applied to the selected cells.
+   * 
+   * @param {HTMLTableElement} table - Gerrit diff table that contains the 
+   * selected rows
+   */
   function clearSelection(table) {
     selectedLines.clear();
     table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
@@ -182,7 +230,16 @@ Gerrit.install(plugin => {
     });
   }
 
-  // AC1: Mark all anchored lines with visual indicators  
+  /**
+   * Marks lines associated w/ a multi-anchor comment. Adds the class 
+   * 'multi-anchor-existing' to all of the table cells on the selected lines,
+   * visually indicating they are anchored in a comment thread.
+   * 
+   * AC1
+   * 
+   * @param {HTMLTableElement} table - Gerrit diff table
+   * @param {*} lines - array of line keys 
+   */
   function markAnchoredLines(table, lines) {
     lines.forEach(lineKey => {
       const [side, lineNum] = lineKey.split('-');
@@ -195,7 +252,16 @@ Gerrit.install(plugin => {
     });
   }
 
-  // AC2: Highlight lines associated with a comment on hover/click
+
+  /**
+   * Temporarily highlihgts the lines associated with a multi-anchor comment
+   * 
+   * Specifically, used for the hover/click interactions (AC2), visually 
+   * linking comment thread with its lines 
+   * 
+   * @param {HTMLTableElement} table - Gerrit diff table
+   * @param {*} lines - array of line keys 
+   */
   function highlightCommentLines(table, lines) {
     lines.forEach(lineKey => {
       const [side, lineNum] = lineKey.split('-');
@@ -208,6 +274,14 @@ Gerrit.install(plugin => {
     });
   }
 
+
+  /**
+   * Reverses the effects of highlightCommentLines, removing the 'multi-anchor-highlighted'
+   * class from the specified lines
+   * 
+   * @param {HTMLTableElement} table - Gerrit diff table
+   * @param {string[]} lines - array of line keys that will be unhighlighted
+   */
   function unhighlightCommentLines(table, lines) {
     lines.forEach(lineKey => {
       const [side, lineNum] = lineKey.split('-');
@@ -226,6 +300,12 @@ Gerrit.install(plugin => {
     return div.innerHTML;
   }
 
+  /**
+   * Renders the saved multi-anchored comments in the diff table. Comment threads
+   * will be inserted after the last anchored line for a given comment
+   * 
+   * @param {*} table - Gerrit diff table
+   */
   function displaySavedComments(table) {
     // Remove all existing comment threads first
     table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
@@ -338,6 +418,11 @@ Gerrit.install(plugin => {
     });
   }
 
+  /**
+   * Retrieves nested diff element, returning null if element isn't available
+   * 
+   * @returns {HTMLElement | null} - the diff element, or null if doesn't exist
+   */
   function getDiffElement() {
     try {
       return document.querySelector('gr-app').shadowRoot
@@ -352,6 +437,16 @@ Gerrit.install(plugin => {
     }
   }
 
+  /**
+   * Attaches all of the necessary event listeners for the multi-anchor comment
+   * system, including:
+   *  - polling for diff elements/table
+   *  - providing styles for the plugin
+   *  - renders saved comments when it's loaded
+   *  - handles multi-line selection and keyboard shortcuts
+   * 
+   * @returns {void}
+   */
   function attachListeners() {
     const diffElement = getDiffElement();
     if (!diffElement) {
