@@ -1,3 +1,14 @@
+/**
+ * Multi-Anchor Comment Plugin for Gerrit
+ *
+ * Extends Gerrit's code review UI to support comments anchored to multiple
+ * non-adjacent lines within a single diff view. Standard Gerrit only allows
+ * comments on a single line or a contiguous range; this plugin lets reviewers
+ * reference scattered but related lines (e.g., a renamed variable and all its
+ * call sites) in one comment thread.
+ *
+ * @see README.md for build and usage instructions.
+ */
 Gerrit.install(plugin => {
 
   console.log('[multianchor-comment] JS loaded');
@@ -6,13 +17,13 @@ Gerrit.install(plugin => {
   const savedComments = new Map();
   let commentIdCounter = 1;
 
-
   /**
    * Injects CSS styles into the Gerrit diff element that are specific to the
    * multi-anchor comment plug-in
    * 
    * This function appends a <style> tag to the diffElement that is provided
-   * in the function call.
+   * in the function call, highlighting (yellow), anchored-line indicators
+   * (blue border), and hover highlights.
    * 
    * Styles rely on Gerrit's slass names and table structure.
    * 
@@ -57,6 +68,7 @@ Gerrit.install(plugin => {
     diffElement.appendChild(style);
   }
 
+  /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
   const selectedLines = new Set();
 
   /** 
@@ -86,9 +98,10 @@ Gerrit.install(plugin => {
 
   /**
    * Creates, inserts, and does the rendering for a multi-anchor comment draft box
-   * in the diff table. It places the box after the last selected line, and also 
-   * presents the textarea for the comment body, the checkbox for toggling the
-   * resolved state, and the buttons for canceling and saving the comment.
+   * in the diff table. 
+   * 
+   * US2: Renders a draft comment box anchored below the last selected line.
+   * Displays all anchored line numbers for confirmation and provides Save/Cancel actions.
    * 
    * @param {HTMLTableElement} table - the Gerrit diff table
    * @param {Set<String>} selectedLines - set of line keys that are currently 
@@ -208,8 +221,7 @@ Gerrit.install(plugin => {
   }
 
   /**
-   * Clears all of the currerntly selected lines, removing the visual indicators
-   * of selection as well.
+   * Clears all selected lines and removes their visual highlights.
    * 
    * This function empties the selectedLines Set, and removes inline styling 
    * that was applied to the selected cells.
@@ -217,6 +229,7 @@ Gerrit.install(plugin => {
    * @param {HTMLTableElement} table - Gerrit diff table that contains the 
    * selected rows
    */
+
   function clearSelection(table) {
     selectedLines.clear();
     table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
@@ -303,6 +316,9 @@ Gerrit.install(plugin => {
   /**
    * Renders the saved multi-anchored comments in the diff table. Comment threads
    * will be inserted after the last anchored line for a given comment
+   * 
+   * US3: Re-renders all saved comment threads and their associated line markers.
+   * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
    * 
    * @param {*} table - Gerrit diff table
    */
@@ -419,9 +435,14 @@ Gerrit.install(plugin => {
   }
 
   /**
-   * Retrieves nested diff element, returning null if element isn't available
+   * Traverses Gerrit's nested shadow DOM to reach the diff table element.
+   * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
+   * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
    * 
    * @returns {HTMLElement | null} - the diff element, or null if doesn't exist
+   * Traverses Gerrit's nested shadow DOM to reach the diff table element.
+   * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
+   * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
    */
   function getDiffElement() {
     try {
@@ -438,7 +459,8 @@ Gerrit.install(plugin => {
   }
 
   /**
-   * Attaches all of the necessary event listeners for the multi-anchor comment
+   * Attaches click and keyboard listeners to the diff table once it's available.
+   * Retries via setTimeout if the diff hasn't rendered yet (Gerrit loads lazily).
    * system, including:
    *  - polling for diff elements/table
    *  - providing styles for the plugin
@@ -465,6 +487,8 @@ Gerrit.install(plugin => {
     // Display any saved comments on initial load
     displaySavedComments(table);
 
+    // US1 + US5: Only intercept clicks with Ctrl/Cmd held, so normal Gerrit
+    // interactions (single-line comments, navigation) are unaffected.
     table.addEventListener('click', function (e) {
       if (!e.ctrlKey && !e.metaKey) {
         return;
@@ -502,6 +526,8 @@ Gerrit.install(plugin => {
       e.stopPropagation();
     });
 
+    // US2: 'c' opens a comment box; Escape dismisses it. Uses capture phase
+    // to intercept before Gerrit's own 'c' shortcut (single-line comment).
     document.addEventListener('keydown', function (e) {
       // Block if typing in any text field (check both target and active element)
       const tag = e.target.tagName;
