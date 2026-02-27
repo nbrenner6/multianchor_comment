@@ -1,3 +1,14 @@
+/**
+ * Multi-Anchor Comment Plugin for Gerrit
+ *
+ * Extends Gerrit's code review UI to support comments anchored to multiple
+ * non-adjacent lines within a single diff view. Standard Gerrit only allows
+ * comments on a single line or a contiguous range; this plugin lets reviewers
+ * reference scattered but related lines (e.g., a renamed variable and all its
+ * call sites) in one comment thread.
+ *
+ * @see README.md for build and usage instructions.
+ */
 Gerrit.install(plugin => {
 
   console.log('[multianchor-comment] JS loaded');
@@ -6,6 +17,7 @@ Gerrit.install(plugin => {
   const savedComments = new Map();
   let commentIdCounter = 1;
 
+  /** Injects CSS classes for selection highlighting (yellow), anchored-line indicators (blue border), and hover highlights. */
   function injectStyles(diffElement) {
     const style = document.createElement('style');
     style.textContent = `
@@ -44,8 +56,10 @@ Gerrit.install(plugin => {
     diffElement.appendChild(style);
   }
 
+  /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
   const selectedLines = new Set();
 
+  /** US1: Toggles a line's selected state and updates its visual highlight. */
   function toggleLine(lineKey, side, row) {
     if (selectedLines.has(lineKey)) {
       selectedLines.delete(lineKey);
@@ -57,6 +71,10 @@ Gerrit.install(plugin => {
     }
   }
 
+  /**
+   * US2: Renders a draft comment box anchored below the last selected line.
+   * Displays all anchored line numbers for confirmation and provides Save/Cancel actions.
+   */
   function showCommentBox(table, selectedLines) {
     const existing = table.querySelector('tr.multi-anchor-comment-row');
     if (existing) {
@@ -169,6 +187,7 @@ Gerrit.install(plugin => {
     tr.querySelector('.multi-anchor-textarea').focus();
   }
 
+  /** Clears all selected lines and removes their visual highlights. */
   function clearSelection(table) {
     selectedLines.clear();
     table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
@@ -226,6 +245,10 @@ Gerrit.install(plugin => {
     return div.innerHTML;
   }
 
+  /**
+   * US3: Re-renders all saved comment threads and their associated line markers.
+   * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
+   */
   function displaySavedComments(table) {
     // Remove all existing comment threads first
     table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
@@ -338,6 +361,11 @@ Gerrit.install(plugin => {
     });
   }
 
+  /**
+   * Traverses Gerrit's nested shadow DOM to reach the diff table element.
+   * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
+   * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
+   */
   function getDiffElement() {
     try {
       return document.querySelector('gr-app').shadowRoot
@@ -352,6 +380,10 @@ Gerrit.install(plugin => {
     }
   }
 
+  /**
+   * Attaches click and keyboard listeners to the diff table once it's available.
+   * Retries via setTimeout if the diff hasn't rendered yet (Gerrit loads lazily).
+   */
   function attachListeners() {
     const diffElement = getDiffElement();
     if (!diffElement) {
@@ -370,6 +402,8 @@ Gerrit.install(plugin => {
     // Display any saved comments on initial load
     displaySavedComments(table);
 
+    // US1 + US5: Only intercept clicks with Ctrl/Cmd held, so normal Gerrit
+    // interactions (single-line comments, navigation) are unaffected.
     table.addEventListener('click', function (e) {
       if (!e.ctrlKey && !e.metaKey) {
         return;
@@ -407,6 +441,8 @@ Gerrit.install(plugin => {
       e.stopPropagation();
     });
 
+    // US2: 'c' opens a comment box; Escape dismisses it. Uses capture phase
+    // to intercept before Gerrit's own 'c' shortcut (single-line comment).
     document.addEventListener('keydown', function (e) {
       // Block if typing in any text field (check both target and active element)
       const tag = e.target.tagName;
