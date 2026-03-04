@@ -11,8 +11,6 @@
  */
 Gerrit.install(plugin => {
 
-  console.log('[multianchor-comment] JS loaded');
-
   // Get the plugin's REST API helper
   const restApi = plugin.restApi();
 
@@ -68,20 +66,20 @@ Gerrit.install(plugin => {
         rangeEnd = lineNums[i];
       } else {
         ranges.push({
-          startLine: rangeStart,
-          startCharacter: 0,
-          endLine: rangeEnd,
-          endCharacter: 0
+          start_line: rangeStart,
+          start_character: 0,
+          end_line: rangeEnd,
+          end_character: 0
         });
         rangeStart = lineNums[i];
         rangeEnd = lineNums[i];
       }
     }
     ranges.push({
-      startLine: rangeStart,
-      startCharacter: 0,
-      endLine: rangeEnd,
-      endCharacter: 0
+      start_line: rangeStart,
+      start_character: 0,
+      end_line: rangeEnd,
+      end_character: 0
     });
 
     return ranges;
@@ -93,19 +91,18 @@ Gerrit.install(plugin => {
    * For whole-line selections, we only send 'line' (no range).
    * @returns {Promise<Object>} The created comment info
    */
-  async function createDraft(changeNum, patchSet, path, range, message) {
+  async function createDraft(changeNum, patchSet, path, range, message, unresolved) {
     const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
 
     // For whole-line selections (startChar=0, endChar=0), don't send a range
     // Just use the line number like native Gerrit comments
     const body = {
       path: path,
-      line: range.endLine,
-      message: message
+      line: range.end_line,
+      message: message,
+      unresolved: unresolved
     };
 
-    console.log('[multianchor] Creating draft:', endpoint);
-    console.log('[multianchor] Request body:', JSON.stringify(body, null, 2));
     return restApi.put(endpoint, body);
   }
 
@@ -114,7 +111,6 @@ Gerrit.install(plugin => {
    */
   async function deleteDraft(changeNum, patchSet, draftId) {
     const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`;
-    console.log('[multianchor] Deleting draft:', endpoint);
     return restApi.delete(endpoint);
   }
 
@@ -124,8 +120,7 @@ Gerrit.install(plugin => {
   async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
     const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
     const body = { ranges: ranges };
-    console.log('[multianchor] Saving additional ranges:', endpoint, body);
-    return restApi.put(endpoint, body);
+    return await restApi.put(endpoint, body);
   }
 
   /**
@@ -141,7 +136,6 @@ Gerrit.install(plugin => {
    */
   async function deleteAdditionalRanges(changeNum, commentUuid) {
     const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
-    console.log('[multianchor] Deleting additional ranges:', endpoint);
     return restApi.delete(endpoint);
   }
 
@@ -165,9 +159,6 @@ Gerrit.install(plugin => {
       // Get all additional ranges from plugin
       const additionalRanges = await getAllAdditionalRanges(changeNum);
 
-      console.log('[multianchor] Loaded drafts:', drafts);
-      console.log('[multianchor] Loaded additional ranges:', additionalRanges);
-
       // Clear and rebuild cache
       savedComments.clear();
 
@@ -179,13 +170,17 @@ Gerrit.install(plugin => {
 
           // Only include comments that have additional ranges (multi-anchor)
           if (extraRanges.length > 0) {
-            // Combine primary range with additional ranges
-            const allRanges = comment.range ? [comment.range, ...extraRanges] : extraRanges;
+            // Combine primary range with additional ranges.
+            // comment.range is only set when we sent a range object; when we sent only `line`,
+            // Gerrit stores no range so we reconstruct it from comment.line.
+            const primaryRange = comment.range ||
+              (comment.line ? {start_line: comment.line, start_character: 0, end_line: comment.line, end_character: 0} : null);
+            const allRanges = primaryRange ? [primaryRange, ...extraRanges] : extraRanges;
 
             // Convert ranges to line keys for UI
             const lines = allRanges.flatMap(range => {
               const lineKeys = [];
-              for (let line = range.startLine; line <= range.endLine; line++) {
+              for (let line = range.start_line; line <= range.end_line; line++) {
                 lineKeys.push(`right-${line}`);  // Assuming right side for now
               }
               return lineKeys;
@@ -204,10 +199,8 @@ Gerrit.install(plugin => {
         }
       }
 
-      console.log('[multianchor] Cached comments:', savedComments);
       return savedComments;
     } catch (error) {
-      console.error('[multianchor] Error loading comments:', error);
       return savedComments;
     }
   }
@@ -221,7 +214,6 @@ Gerrit.install(plugin => {
     const path = getFilePath();
 
     if (!changeNum || !path) {
-      console.error('[multianchor] Cannot determine change or file path');
       return null;
     }
 
@@ -234,16 +226,13 @@ Gerrit.install(plugin => {
     const allRanges = lineKeysToRanges(selectedLines, side);
 
     if (allRanges.length === 0) {
-      console.error('[multianchor] No valid ranges selected');
       return null;
     }
 
     try {
       // 1. Create draft with primary (first) range via Gerrit API
       const primaryRange = allRanges[0];
-      const draft = await createDraft(changeNum, patchSet, path, primaryRange, message);
-
-      console.log('[multianchor] Created draft:', draft);
+      const draft = await createDraft(changeNum, patchSet, path, primaryRange, message, !resolved);
 
       // 2. If there are additional ranges, save them via plugin API
       if (allRanges.length > 1) {
@@ -264,7 +253,6 @@ Gerrit.install(plugin => {
 
       return draft;
     } catch (error) {
-      console.error('[multianchor] Error creating comment:', error);
       return null;
     }
   }
@@ -277,23 +265,21 @@ Gerrit.install(plugin => {
     const patchSet = getPatchSetNumber();
 
     if (!changeNum) {
-      console.error('[multianchor] Cannot determine change number');
       return false;
     }
 
     try {
-      // 1. Delete additional ranges from plugin storage
-      await deleteAdditionalRanges(changeNum, commentId);
-
-      // 2. Delete draft from Gerrit
+      // 1. Delete draft from Gerrit first
       await deleteDraft(changeNum, patchSet, commentId);
+
+      // 2. Delete additional ranges from plugin storage
+      await deleteAdditionalRanges(changeNum, commentId);
 
       // 3. Remove from local cache
       savedComments.delete(commentId);
 
       return true;
     } catch (error) {
-      console.error('[multianchor] Error deleting comment:', error);
       return false;
     }
   }
@@ -301,14 +287,14 @@ Gerrit.install(plugin => {
   /**
    * Injects CSS styles into the Gerrit diff element that are specific to the
    * multi-anchor comment plug-in
-   * 
+   *
    * This function appends a <style> tag to the diffElement that is provided
    * in the function call, highlighting (yellow), anchored-line indicators
    * (blue border), and hover highlights.
-   * 
+   *
    * Styles rely on Gerrit's slass names and table structure.
-   * 
-   * @param {HTMLElement} diffElement 
+   *
+   * @param {HTMLElement} diffElement
    * @returns {void}
    */
   function injectStyles(diffElement) {
@@ -352,15 +338,15 @@ Gerrit.install(plugin => {
   /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
   const selectedLines = new Set();
 
-  /** 
-   * Toggles the selected state for a specific diff line in a multi-anchor 
+  /**
+   * Toggles the selected state for a specific diff line in a multi-anchor
    * comment
-   * 
+   *
    * If the lineKey has already been selected, it updates the global variable,
    * selectedLinesSet, removing it. It also updates the corresponding table cells,
    * removing the selected class. If the lineKey has NOT already been selected,
    * this function adds its corresponding lineKey and gives it the selected styling.
-   * 
+   *
    * @param {string} lineKey - unique ID for a line, uses the format "side-lineNum"
    * @param {"left" | "right"} side - denotes the side of the diff the line is on
    * @param {HTMLTableRowElement} row - the row element representing the line in the diff
@@ -379,13 +365,13 @@ Gerrit.install(plugin => {
 
   /**
    * Creates, inserts, and does the rendering for a multi-anchor comment draft box
-   * in the diff table. 
-   * 
+   * in the diff table.
+   *
    * US2: Renders a draft comment box anchored below the last selected line.
    * Displays all anchored line numbers for confirmation and provides Save/Cancel actions.
-   * 
+   *
    * @param {HTMLTableElement} table - the Gerrit diff table
-   * @param {Set<String>} selectedLines - set of line keys that are currently 
+   * @param {Set<String>} selectedLines - set of line keys that are currently
    * selected
    * @returns {void}
    */
@@ -485,19 +471,16 @@ Gerrit.install(plugin => {
         const draft = await createMultiAnchorComment(selectedLines, text, resolved);
 
         if (draft) {
-          console.log('[multianchor] Comment saved:', draft);
           tr.remove();
           clearSelection(table);
 
           // Display the saved comment with AC1, AC2, AC3 handlers
           displaySavedComments(table);
         } else {
-          console.error('[multianchor] Failed to save comment');
           tr.querySelector('.multi-anchor-save').disabled = false;
           tr.querySelector('.multi-anchor-save').textContent = 'Save';
         }
       } catch (error) {
-        console.error('[multianchor] Error saving comment:', error);
         tr.querySelector('.multi-anchor-save').disabled = false;
         tr.querySelector('.multi-anchor-save').textContent = 'Save';
       }
@@ -513,11 +496,11 @@ Gerrit.install(plugin => {
 
   /**
    * Clears all selected lines and removes their visual highlights.
-   * 
-   * This function empties the selectedLines Set, and removes inline styling 
+   *
+   * This function empties the selectedLines Set, and removes inline styling
    * that was applied to the selected cells.
-   * 
-   * @param {HTMLTableElement} table - Gerrit diff table that contains the 
+   *
+   * @param {HTMLTableElement} table - Gerrit diff table that contains the
    * selected rows
    */
 
@@ -535,14 +518,14 @@ Gerrit.install(plugin => {
   }
 
   /**
-   * Marks lines associated w/ a multi-anchor comment. Adds the class 
+   * Marks lines associated w/ a multi-anchor comment. Adds the class
    * 'multi-anchor-existing' to all of the table cells on the selected lines,
    * visually indicating they are anchored in a comment thread.
-   * 
+   *
    * AC1
-   * 
+   *
    * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys 
+   * @param {*} lines - array of line keys
    */
   function markAnchoredLines(table, lines) {
     lines.forEach(lineKey => {
@@ -559,12 +542,12 @@ Gerrit.install(plugin => {
 
   /**
    * Temporarily highlihgts the lines associated with a multi-anchor comment
-   * 
-   * Specifically, used for the hover/click interactions (AC2), visually 
-   * linking comment thread with its lines 
-   * 
+   *
+   * Specifically, used for the hover/click interactions (AC2), visually
+   * linking comment thread with its lines
+   *
    * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys 
+   * @param {*} lines - array of line keys
    */
   function highlightCommentLines(table, lines) {
     lines.forEach(lineKey => {
@@ -582,7 +565,7 @@ Gerrit.install(plugin => {
   /**
    * Reverses the effects of highlightCommentLines, removing the 'multi-anchor-highlighted'
    * class from the specified lines
-   * 
+   *
    * @param {HTMLTableElement} table - Gerrit diff table
    * @param {string[]} lines - array of line keys that will be unhighlighted
    */
@@ -607,10 +590,10 @@ Gerrit.install(plugin => {
   /**
    * Renders the saved multi-anchored comments in the diff table. Comment threads
    * will be inserted after the last anchored line for a given comment
-   * 
+   *
    * US3: Re-renders all saved comment threads and their associated line markers.
    * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
-   * 
+   *
    * @param {*} table - Gerrit diff table
    */
   function displaySavedComments(table) {
@@ -693,14 +676,12 @@ Gerrit.install(plugin => {
         try {
           const success = await deleteMultiAnchorComment(commentId);
           if (success) {
-            console.log('[multianchor] Comment deleted:', commentId);
             displaySavedComments(table);
           } else {
             btn.disabled = false;
             btn.textContent = 'Discard';
           }
         } catch (error) {
-          console.error('[multianchor] Error deleting comment:', error);
           btn.disabled = false;
           btn.textContent = 'Discard';
         }
@@ -746,7 +727,7 @@ Gerrit.install(plugin => {
    * Traverses Gerrit's nested shadow DOM to reach the diff table element.
    * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
    * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
-   * 
+   *
    * @returns {HTMLElement | null} - the diff element, or null if doesn't exist
    * Traverses Gerrit's nested shadow DOM to reach the diff table element.
    * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
@@ -766,6 +747,61 @@ Gerrit.install(plugin => {
     }
   }
 
+  function getGrDiffHost() {
+    try {
+      return document.querySelector('gr-app').shadowRoot
+        .querySelector('gr-app-element').shadowRoot
+        .querySelector('gr-diff-view').shadowRoot
+        .querySelector('gr-diff-host');
+    }
+    catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Hides any native Gerrit comment threads whose rootId is in savedComments.
+   * Multi-anchor comments are rendered by the plugin, so the native thread is redundant.
+   */
+  function hideNativeThreadsForMultiAnchor(root) {
+    if (savedComments.size === 0) return;
+    root.querySelectorAll('gr-comment-thread').forEach(threadEl => {
+      try {
+        const thread = threadEl.thread;
+        if (!thread) return;
+        const rootId = thread.rootId ||
+          (thread.comments && thread.comments[0] && thread.comments[0].id);
+        if (rootId && savedComments.has(rootId)) {
+          threadEl.style.display = 'none';
+          const tr = threadEl.closest('tr');
+          if (tr) tr.style.display = 'none';
+        }
+      } catch (e) {
+        // ignore — thread property may not be set yet
+      }
+    });
+  }
+
+  /**
+   * Sets up a MutationObserver on the gr-diff-host shadow root so that native
+   * Gerrit comment threads for multi-anchor comments are hidden whenever Gerrit
+   * (re-)renders them.
+   */
+  function setupNativeThreadHider() {
+    const grDiffHost = getGrDiffHost();
+    if (!grDiffHost || !grDiffHost.shadowRoot) return;
+
+    const root = grDiffHost.shadowRoot;
+
+    // Run once immediately in case threads are already rendered
+    hideNativeThreadsForMultiAnchor(root);
+
+    const observer = new MutationObserver(() => {
+      hideNativeThreadsForMultiAnchor(root);
+    });
+    observer.observe(root, {childList: true, subtree: true});
+  }
+
   /**
    * Attaches click and keyboard listeners to the diff table once it's available.
    * Retries via setTimeout if the diff hasn't rendered yet (Gerrit loads lazily).
@@ -774,7 +810,7 @@ Gerrit.install(plugin => {
    *  - providing styles for the plugin
    *  - renders saved comments when it's loaded
    *  - handles multi-line selection and keyboard shortcuts
-   * 
+   *
    * @returns {void}
    */
   function attachListeners() {
@@ -798,6 +834,7 @@ Gerrit.install(plugin => {
     if (changeNum) {
       loadMultiAnchorComments(changeNum, patchSet).then(() => {
         displaySavedComments(table);
+        setupNativeThreadHider();
       });
     }
 
@@ -835,7 +872,6 @@ Gerrit.install(plugin => {
       const lineKey = `${side}-${lineNum}`;
       toggleLine(lineKey, side, row);
 
-      console.log('Selected lines:', [...selectedLines]);
       e.preventDefault();
       e.stopPropagation();
     });
@@ -856,7 +892,6 @@ Gerrit.install(plugin => {
       }
 
       if (e.key === 'c' && selectedLines.size > 0) {
-        console.log('c pressed, showing multi-anchor box');
         e.stopImmediatePropagation();
         e.preventDefault();
         showCommentBox(table, selectedLines);
