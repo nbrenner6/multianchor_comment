@@ -16,6 +16,24 @@ import com.google.gerrit.extensions.restapi.Response;
 
 import com.googlesource.gerrit.plugins.multianchorcomment.storage.MultiAnchorStorage;
 
+/**
+ * Unit tests for DeleteMultiAnchorRanges.
+ *
+ * These tests verify that the endpoint correctly deletes additional comment
+ * ranges via MultiAnchorStorage.
+ *
+ * Covered scenarios:
+ * - Successful deletion (happy path)
+ * - Ensuring storage.deleteRanges is invoked with correct arguments
+ * - Verifying method is called the expected number of times
+ * - Handling multiple deletion calls
+ * - Supporting different resources (project/change/comment variations)
+ * - Propagating IOException from storage
+ *
+ * The tests focus on validating side effects (interaction with storage)
+ * rather than return values, since the endpoint returns a no-content response.
+ */
+
 public class DeleteMultiAnchorRangesTest {
 
   @Mock private MultiAnchorStorage storage;

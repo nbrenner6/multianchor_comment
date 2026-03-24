@@ -20,6 +20,25 @@ import com.google.gerrit.extensions.restapi.Response;
 
 import com.googlesource.gerrit.plugins.multianchorcomment.storage.MultiAnchorStorage;
 
+/**
+ * Unit tests for GetMultiAnchorRanges.
+ *
+ * These tests verify that the endpoint correctly retrieves additional comment
+ * ranges from MultiAnchorStorage and returns them in the REST response.
+ *
+ * Covered scenarios:
+ * - Returning multiple ranges from storage
+ * - Handling empty and null results
+ * - Returning a single range
+ * - Propagating IOException from storage
+ * - Verifying correct interaction with storage (arguments + call count)
+ * - Handling unusual or edge-case range values
+ * - Supporting multiple resources (different project/change/comment IDs)
+ *
+ * The tests use Mockito to mock storage and resource inputs, and validate
+ * that the response structure and values match expected behavior.
+ */
+
 public class GetMultiAnchorRangesTest {
 
   @Mock private MultiAnchorStorage storage;
