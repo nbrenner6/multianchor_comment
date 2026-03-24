@@ -90,6 +90,10 @@ Press 'c'
 
 You should see a "Draft - Multi-anchor: <selected lines>" comment box appear!
 
+# Testing
+
+To run the test suite, run: `bazel test //plugins/multianchor_comment:multianchor_comment_tests`
+
 # Tips
 
 When you make an edit, you can rebuild, copy the jar to the development directory (use sudo), and then run the jar.
