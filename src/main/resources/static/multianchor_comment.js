@@ -335,6 +335,61 @@ Gerrit.install(plugin => {
     diffElement.appendChild(style);
   }
 
+  // Inject AI Review button into the diff toolbar
+  function injectAiReviewButton(diffElement) {
+    if (diffElement.querySelector('#ma-ai-review-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'ma-ai-review-btn';
+    btn.textContent = '🤖 AI Review';
+    btn.style.cssText = `
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      background: rgb(25, 103, 210);
+      color: white;
+      border: none;
+      border-radius: 24px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      font-family: var(--font-family), 'Roboto', Arial, sans-serif;
+    `;
+
+    btn.addEventListener('click', async () => {
+      const changeNum = getChangeNumber();
+      const patchSet  = getPatchSetNumber();
+      if (!changeNum) return;
+
+      btn.disabled    = true;
+      btn.textContent = '🤖 Reviewing...';
+
+      try {
+        const endpoint = `/changes/${changeNum}/revisions/${patchSet}/ai-review`;
+        await restApi.post(endpoint, { prompt: '' });
+
+        // Reload multi-anchor comments so AI drafts appear
+        await loadMultiAnchorComments(changeNum, patchSet);
+        const table = diffElement.querySelector('table#diffTable');
+        if (table) displaySavedComments(table);
+
+        btn.textContent = '✓ Done';
+        setTimeout(() => {
+          btn.disabled    = false;
+          btn.textContent = '🤖 AI Review';
+        }, 3000);
+      } catch (err) {
+        btn.disabled    = false;
+        btn.textContent = '🤖 AI Review';
+      }
+    });
+
+    document.body.appendChild(btn);
+  }
+
   /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
   const selectedLines = new Set();
 
@@ -821,6 +876,7 @@ Gerrit.install(plugin => {
     }
 
     injectStyles(diffElement);
+    injectAiReviewButton(diffElement);
 
     const table = diffElement.querySelector('table#diffTable');
     if (!table) {
@@ -907,4 +963,21 @@ Gerrit.install(plugin => {
   }
 
   setTimeout(attachListeners, 1000);
+
+  // add a button to the Gerrit toolbar
+  async function triggerAiReview() {
+    const changeNum = getChangeNumber();
+    const patchSet  = getPatchSetNumber();
+    if (!changeNum) return;
+
+    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/ai-review`;
+    await restApi.post(endpoint, { prompt: '' });
+
+    // reload so the new robot comments
+    const table = getDiffElement()?.querySelector('table#diffTable');
+    if (table) {
+      await loadMultiAnchorComments(changeNum, patchSet);
+      displaySavedComments(table);
+    }
+  }
 });
