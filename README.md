@@ -70,6 +70,9 @@ Run: `ssh -p 29418 localhost gerrit version` to check your gerrit version
 
 Create a new GitHub repo locally. Then, run: `ssh -i ~/.ssh/id_gerrit -p 29418 admin@localhost gerrit create-project <repo-name>`
 
+  - If you re-initalized Gerrit, you may have to run `ssh-keygen -R "[localhost]:29418"` first
+  - If the user does not exist, you can create one with username "admin" and full name "Admin"
+
 Add Gerrit as a remote: `git remote add gerrit ssh://localhost:29418/<repo-name>`
 
 Install Gerrit commit-msg hook (necessary):
