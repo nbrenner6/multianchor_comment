@@ -18,5 +18,6 @@ junit_tests(
     visibility = ["//visibility:public"],
     runtime_deps = [":multianchor_comment__plugin"],
     deps = [
-        ":multianchor_comment__plugin",] + PLUGIN_TEST_DEPS + PLUGIN_DEPS,
+        ":multianchor_comment__plugin",
+    ] + PLUGIN_TEST_DEPS + PLUGIN_DEPS,
 )
