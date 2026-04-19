@@ -7,6 +7,7 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.googlesource.gerrit.plugins.multianchorcomment.storage.MultiAnchorStorage;
 import java.io.IOException;
+
 import java.util.List;
 
 /**
