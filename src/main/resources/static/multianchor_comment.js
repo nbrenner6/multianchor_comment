@@ -2,10 +2,10 @@
  * Multi-Anchor Comment Plugin for Gerrit
  *
  * Extends Gerrit's code review UI to support comments anchored to multiple
- * non-adjacent lines within a single diff view. Standard Gerrit only allows
- * comments on a single line or a contiguous range; this plugin lets reviewers
- * reference scattered but related lines (e.g., a renamed variable and all its
- * call sites) in one comment thread.
+ * non-adjacent lines and across multiple files in the same change. Standard
+ * Gerrit only allows comments on a single line or a contiguous range; this
+ * plugin lets reviewers reference scattered but related lines (e.g., a call
+ * site and its definition in another file) in one comment thread.
  *
  * @see README.md for build and usage instructions.
  */
@@ -16,6 +16,9 @@ Gerrit.install(plugin => {
   // In-memory storage for multi-anchor comments
   const savedComments = new Map();
   let commentIdCounter = 1;
+
+  /** Set of JSON anchor keys ({repo path, side, line}). Cleared on comment save/cancel. */
+  const selectedLines = new Set();
 
   /**
    * Injects CSS styles into the Gerrit diff element that are specific to the
@@ -68,8 +71,348 @@ Gerrit.install(plugin => {
     diffElement.appendChild(style);
   }
 
-  /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
-  const selectedLines = new Set();
+  /**
+   * Styles are attached per gr-diff-element instance. Gerrit can replace that
+   * element on file switches, so re-check before interactions.
+   *
+   * @param {HTMLElement | null} diffElement
+   */
+  function ensureStylesInjected(diffElement) {
+    if (!diffElement) {
+      return;
+    }
+    if (!diffElement.dataset.multianchorStylesInjected) {
+      diffElement.dataset.multianchorStylesInjected = '1';
+      injectStyles(diffElement);
+    }
+  }
+
+  /**
+   * @param {string} filePath - repo path for this diff (from gr-diff-host)
+   * @param {"left" | "right"} side
+   * @param {string} lineNum
+   */
+  function makeAnchorKey(filePath, side, lineNum) {
+    return JSON.stringify({ p: filePath, s: side, n: String(lineNum) });
+  }
+
+  /**
+   * @param {string} key
+   * @returns {{ path: string, side: string, lineNum: string } | null}
+   */
+  function parseAnchorKey(key) {
+    try {
+      const o = JSON.parse(key);
+      if (o && o.p != null && o.s && o.n != null) {
+        return { path: o.p, side: o.s, lineNum: o.n };
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return null;
+  }
+
+  /**
+   * @param {string} key
+   * @returns {string}
+   */
+  function formatAnchorLabel(key) {
+    const a = parseAnchorKey(key);
+    if (!a) {
+      return key;
+    }
+    const base = (a.path && a.path.includes('/')) ? a.path.split('/').pop() : a.path;
+    const lr = a.side === 'left' ? 'L' : 'R';
+    return a.path ? `${base}:${lr}${a.lineNum}` : `${lr}${a.lineNum}`;
+  }
+
+  /**
+   * Formats anchors as grouped-by-file labels, e.g.
+   * "foo.js: R2, R4; bar.js: L10".
+   *
+   * @param {string[]} keys
+   * @returns {string}
+   */
+  function formatGroupedAnchorLabels(keys) {
+    const byPath = new Map();
+    keys.forEach(key => {
+      const a = parseAnchorKey(key);
+      if (!a) {
+        return;
+      }
+      const base = (a.path && a.path.includes('/')) ? a.path.split('/').pop() : a.path;
+      const fileLabel = base || a.path || 'unknown-file';
+      const lineLabel = `${a.side === 'left' ? 'L' : 'R'}${a.lineNum}`;
+      if (!byPath.has(fileLabel)) {
+        byPath.set(fileLabel, []);
+      }
+      byPath.get(fileLabel).push(lineLabel);
+    });
+
+    if (byPath.size === 0) {
+      return keys.map(formatAnchorLabel).join(', ');
+    }
+    return [...byPath.entries()]
+      .map(([fileLabel, lines]) => `${fileLabel}: ${lines.join(', ')}`)
+      .join('; ');
+  }
+
+  /**
+   * Walks composed ancestors and shadow hosts to find gr-diff-host (holds .path).
+   *
+   * @param {Node | null} node
+   * @returns {HTMLElement | null}
+   */
+  function getGrDiffHostFromNode(node) {
+    let n = node;
+    while (n) {
+      if (n.nodeType === 1 && n.tagName === 'GR-DIFF-HOST') {
+        return /** @type {HTMLElement} */ (n);
+      }
+      const root = n.getRootNode();
+      if (root && root.host) {
+        n = root.host;
+      }
+      else {
+        n = n.parentElement;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * @param {Node | null} node
+   * @returns {string}
+   */
+  function getFilePathForDiffContext(node) {
+    const host = getGrDiffHostFromNode(node);
+    if (!host) {
+      return '';
+    }
+    return host.path || host.getAttribute?.('path') || '';
+  }
+
+  /**
+   * @param {HTMLElement | null} diffElement - gr-diff-element
+   * @returns {{ table: HTMLTableElement | null, filePath: string }}
+   */
+  function getTablePathPair(diffElement) {
+    if (!diffElement) {
+      return { table: null, filePath: '' };
+    }
+    const table =
+      (diffElement.shadowRoot && diffElement.shadowRoot.querySelector('table#diffTable')) ||
+      diffElement.querySelector('table#diffTable');
+    const filePath = getFilePathForDiffContext(diffElement);
+    return { table, filePath };
+  }
+
+  /**
+   * Last anchor in insertion order that belongs to currentPath (for draft placement).
+   *
+   * @param {string[]} keys
+   * @param {string} currentPath
+   * @returns {string | null}
+   */
+  function getLastAnchorKeyForFile(keys, currentPath) {
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const a = parseAnchorKey(keys[i]);
+      if (a && a.path === currentPath) {
+        return keys[i];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * @param {HTMLTableElement} table
+   * @param {{ path: string, side: string, lineNum: string } | null} anchor
+   * @returns {HTMLTableRowElement | null}
+   */
+  function findRowForAnchor(table, anchor) {
+    if (!table || !anchor) {
+      return null;
+    }
+    return table.querySelector(`td.${anchor.side}.lineNum[data-value="${anchor.lineNum}"]`)?.closest('tr') || null;
+  }
+
+  function walkShadowTree(node, callback) {
+    if (!node) {
+      return;
+    }
+    callback(node);
+    if (node.shadowRoot) {
+      walkShadowTree(node.shadowRoot, callback);
+    }
+    const ch = node.children;
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        walkShadowTree(ch[i], callback);
+      }
+    }
+  }
+
+  /**
+   * Clears selected styling everywhere (needed when selection spans files).
+   */
+  function clearSelectionDeep() {
+    selectedLines.clear();
+    walkShadowTree(document.body, (node) => {
+      if (node.nodeType !== 1 || !node.querySelectorAll) {
+        return;
+      }
+      node.querySelectorAll('td.multi-anchor-selected').forEach(td => {
+        td.classList.remove('multi-anchor-selected');
+        td.querySelectorAll('div.contentText').forEach(el => {
+          el.style.backgroundColor = '';
+        });
+        td.querySelectorAll('button.lineNumButton').forEach(el => {
+          el.style.backgroundColor = '';
+        });
+      });
+    });
+  }
+
+  function removeDraftRowsDeep() {
+    walkShadowTree(document.body, (node) => {
+      if (node.nodeType !== 1 || !node.querySelectorAll) {
+        return;
+      }
+      node.querySelectorAll('tr.multi-anchor-comment-row').forEach(tr => tr.remove());
+    });
+  }
+
+  /**
+   * Re-applies yellow selection for pending anchors visible in this file's table.
+   *
+   * @param {HTMLTableElement} table
+   * @param {string} filePath
+   * @returns {number} number of anchors that were re-highlighted
+   */
+  function applyPendingSelectionToTable(table, filePath) {
+    if (!table || !filePath) {
+      return 0;
+    }
+    let appliedCount = 0;
+    selectedLines.forEach(key => {
+      const a = parseAnchorKey(key);
+      if (!a || a.path !== filePath) {
+        return;
+      }
+      const row = findRowForAnchor(table, a);
+      if (row) {
+        setSelectedVisual(row, a.side, true);
+        appliedCount++;
+      }
+    });
+    return appliedCount;
+  }
+
+  /**
+   * @param {string} filePath
+   * @returns {boolean}
+   */
+  function hasPendingAnchorsForFile(filePath) {
+    for (const key of selectedLines) {
+      const a = parseAnchorKey(key);
+      if (a && a.path === filePath) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @returns {{ anchorCount: number, fileCount: number }}
+   */
+  function getPendingAnchorStats() {
+    const files = new Set();
+    selectedLines.forEach(key => {
+      const a = parseAnchorKey(key);
+      if (a && a.path) {
+        files.add(a.path);
+      }
+    });
+    return {
+      anchorCount: selectedLines.size,
+      fileCount: files.size
+    };
+  }
+
+  /**
+   * Gerrit sometimes paints table rows after initial file-switch DOM updates.
+   * Retry a few times so pending selection reappears when returning to a file.
+   *
+   * @param {string} filePath
+   * @param {number} attempt
+   */
+  function schedulePendingSelectionReapply(filePath, attempt) {
+    if (attempt >= 5) {
+      return;
+    }
+    setTimeout(() => {
+      const diffElement = getDiffElement();
+      const { table, filePath: currentPath } = getTablePathPair(diffElement);
+      if (!table || currentPath !== filePath) {
+        return;
+      }
+      const applied = applyPendingSelectionToTable(table, filePath);
+      if (applied === 0 && hasPendingAnchorsForFile(filePath)) {
+        schedulePendingSelectionReapply(filePath, attempt + 1);
+      }
+    }, 140);
+  }
+
+  /**
+   * Re-renders threads for the visible diff and restores in-progress selection for this file.
+   */
+  function refreshCurrentDiffView() {
+    const diffElement = getDiffElement();
+    const { table, filePath } = getTablePathPair(diffElement);
+    if (!table || !filePath) {
+      return;
+    }
+    if (diffObserver) {
+      diffObserver.disconnect();
+    }
+    try {
+      displaySavedComments(table, filePath);
+      const applied = applyPendingSelectionToTable(table, filePath);
+      if (applied === 0 && hasPendingAnchorsForFile(filePath)) {
+        schedulePendingSelectionReapply(filePath, 0);
+      }
+    }
+    finally {
+      if (diffElement.shadowRoot && diffObserver) {
+        diffObserver.observe(diffElement.shadowRoot, { childList: true, subtree: true });
+      }
+    }
+  }
+
+  let documentHooksInstalled = false;
+  let diffObserver = null;
+  let observedDiffRoot = null;
+  let attachPollInstalled = false;
+
+  /**
+   * Applies/removes visible selected styling directly on row cells as a fallback
+   * when Gerrit replaces style scopes during navigation.
+   *
+   * @param {HTMLTableRowElement} row
+   * @param {"left" | "right"} side
+   * @param {boolean} selected
+   */
+  function setSelectedVisual(row, side, selected) {
+    row.querySelectorAll(`td.${side}`).forEach(td => {
+      td.classList.toggle('multi-anchor-selected', selected);
+    });
+    row.querySelectorAll(`td.${side} div.contentText`).forEach(el => {
+      el.style.backgroundColor = selected ? 'rgba(255, 200, 0, 0.3)' : '';
+    });
+    row.querySelectorAll(`td.${side} button.lineNumButton`).forEach(el => {
+      el.style.backgroundColor = selected ? 'rgba(255, 200, 0, 0.3)' : '';
+    });
+  }
 
   /** 
    * Toggles the selected state for a specific diff line in a multi-anchor 
@@ -80,7 +423,7 @@ Gerrit.install(plugin => {
    * removing the selected class. If the lineKey has NOT already been selected,
    * this function adds its corresponding lineKey and gives it the selected styling.
    * 
-   * @param {string} lineKey - unique ID for a line, uses the format "side-lineNum"
+   * @param {string} lineKey - JSON from makeAnchorKey (includes file path)
    * @param {"left" | "right"} side - denotes the side of the diff the line is on
    * @param {HTMLTableRowElement} row - the row element representing the line in the diff
    * @returns {void}
@@ -88,11 +431,11 @@ Gerrit.install(plugin => {
   function toggleLine(lineKey, side, row) {
     if (selectedLines.has(lineKey)) {
       selectedLines.delete(lineKey);
-      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.remove('multi-anchor-selected'));
+      setSelectedVisual(row, side, false);
     }
     else {
       selectedLines.add(lineKey);
-      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.add('multi-anchor-selected'));
+      setSelectedVisual(row, side, true);
     }
   }
 
@@ -103,18 +446,28 @@ Gerrit.install(plugin => {
    * US2: Renders a draft comment box anchored below the last selected line.
    * Displays all anchored line numbers for confirmation and provides Save/Cancel actions.
    * 
-   * @param {HTMLTableElement} table - the Gerrit diff table
-   * @param {Set<String>} selectedLines - set of line keys that are currently 
-   * selected
+   * Draft is placed under the last selected line in the **currently visible** file.
+   * Open a file where you picked lines if the draft does not open (see console).
+   *
+   * @param {HTMLTableElement} table - the Gerrit diff table for the visible file
+   * @param {string} filePath - repo path for that table
    * @returns {void}
    */
-  function showCommentBox(table, selectedLines) {
-    const existing = table.querySelector('tr.multi-anchor-comment-row');
-    if (existing) {
-      existing.remove();
+  function showCommentBox(table, filePath) {
+    removeDraftRowsDeep();
+
+    const keys = [...selectedLines];
+    const positionKey = getLastAnchorKeyForFile(keys, filePath);
+    if (!positionKey) {
+      console.warn(
+        '[multianchor-comment] Open a file where you selected lines to compose the draft (Ctrl/Cmd+click lines, then press c).'
+      );
+      return;
     }
 
-    const lineLabels = [...selectedLines].join(', ');
+    const lineLabels = formatGroupedAnchorLabels(keys);
+    const stats = getPendingAnchorStats();
+    const pendingHint = `(${stats.anchorCount} anchors pending across ${stats.fileCount} files)`;
 
     const tr = document.createElement('tr');
     tr.classList.add('multi-anchor-comment-row');
@@ -134,6 +487,9 @@ Gerrit.install(plugin => {
           <span style="font-weight: var(--font-weight-medium);">Draft</span>
           <span style="color: var(--deemphasized-text-color); margin-left: var(--spacing-s); font-weight: normal;">
             · Multi-anchor: ${lineLabels}
+          </span>
+          <span style="color: var(--deemphasized-text-color); margin-left: var(--spacing-s); font-style: italic;">
+            ${pendingHint}
           </span>
         </div>
         <div style="
@@ -176,10 +532,8 @@ Gerrit.install(plugin => {
       </td>
     `;
 
-    // insert after last
-    const lastLineKey = [...selectedLines][selectedLines.size - 1];
-    const [side, lineNum] = lastLineKey.split('-');
-    const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+    const pos = parseAnchorKey(positionKey);
+    const lastRow = findRowForAnchor(table, pos);
     if (lastRow) {
       lastRow.insertAdjacentElement('afterend', tr);
     }
@@ -206,41 +560,18 @@ Gerrit.install(plugin => {
       console.log('Multi-anchor comment saved:', savedComments.get(commentId));
 
       tr.remove();
-      clearSelection(table);
+      clearSelectionDeep();
 
       // Display the saved comment with AC1, AC2, AC3 handlers
-      displaySavedComments(table);
+      refreshCurrentDiffView();
     });
 
     tr.querySelector('.multi-anchor-cancel').addEventListener('click', () => {
       tr.remove();
-      clearSelection(table);
+      clearSelectionDeep();
     });
 
     tr.querySelector('.multi-anchor-textarea').focus();
-  }
-
-  /**
-   * Clears all selected lines and removes their visual highlights.
-   * 
-   * This function empties the selectedLines Set, and removes inline styling 
-   * that was applied to the selected cells.
-   * 
-   * @param {HTMLTableElement} table - Gerrit diff table that contains the 
-   * selected rows
-   */
-
-  function clearSelection(table) {
-    selectedLines.clear();
-    table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
-      el.style.backgroundColor = '';
-    });
-    table.querySelectorAll('td.multi-anchor-selected button.lineNumButton').forEach(el => {
-      el.style.backgroundColor = '';
-    });
-    table.querySelectorAll('td.multi-anchor-selected').forEach(td => {
-      td.classList.remove('multi-anchor-selected');
-    });
   }
 
   /**
@@ -251,14 +582,18 @@ Gerrit.install(plugin => {
    * AC1
    * 
    * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys 
+   * @param {string} filePath - only anchors for this file are marked in this table
+   * @param {string[]} lines - array of anchor keys
    */
-  function markAnchoredLines(table, lines) {
+  function markAnchoredLines(table, filePath, lines) {
     lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      const a = parseAnchorKey(lineKey);
+      if (!a || a.path !== filePath) {
+        return;
+      }
+      const row = findRowForAnchor(table, a);
       if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
+        row.querySelectorAll(`td.${a.side}`).forEach(td => {
           td.classList.add('multi-anchor-existing');
         });
       }
@@ -273,14 +608,18 @@ Gerrit.install(plugin => {
    * linking comment thread with its lines 
    * 
    * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys 
+   * @param {string} filePath - only anchors in this file are highlighted here
+   * @param {string[]} lines - array of anchor keys
    */
-  function highlightCommentLines(table, lines) {
+  function highlightCommentLines(table, filePath, lines) {
     lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      const a = parseAnchorKey(lineKey);
+      if (!a || a.path !== filePath) {
+        return;
+      }
+      const row = findRowForAnchor(table, a);
       if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
+        row.querySelectorAll(`td.${a.side}`).forEach(td => {
           td.classList.add('multi-anchor-highlighted');
         });
       }
@@ -293,14 +632,18 @@ Gerrit.install(plugin => {
    * class from the specified lines
    * 
    * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {string[]} lines - array of line keys that will be unhighlighted
+   * @param {string} filePath - only anchors in this file
+   * @param {string[]} lines - array of anchor keys that will be unhighlighted
    */
-  function unhighlightCommentLines(table, lines) {
+  function unhighlightCommentLines(table, filePath, lines) {
     lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      const a = parseAnchorKey(lineKey);
+      if (!a || a.path !== filePath) {
+        return;
+      }
+      const row = findRowForAnchor(table, a);
       if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
+        row.querySelectorAll(`td.${a.side}`).forEach(td => {
           td.classList.remove('multi-anchor-highlighted');
         });
       }
@@ -314,15 +657,16 @@ Gerrit.install(plugin => {
   }
 
   /**
-   * Renders the saved multi-anchored comments in the diff table. Comment threads
-   * will be inserted after the last anchored line for a given comment
-   * 
+   * Renders saved comments that touch this file. Threads for multi-file comments
+   * appear once per file (under the last anchor in that file).
+   *
    * US3: Re-renders all saved comment threads and their associated line markers.
    * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
-   * 
-   * @param {*} table - Gerrit diff table
+   *
+   * @param {HTMLTableElement} table - Gerrit diff table
+   * @param {string} filePath - repo path for this diff
    */
-  function displaySavedComments(table) {
+  function displaySavedComments(table, filePath) {
     // Remove all existing comment threads first
     table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
 
@@ -334,18 +678,20 @@ Gerrit.install(plugin => {
       td.classList.remove('multi-anchor-highlighted');
     });
 
-    // Display each saved comment
+    // Display each saved comment that has at least one anchor in this file
     savedComments.forEach((comment, commentId) => {
       const { lines, text, resolved } = comment;
 
-      // AC1: Mark all anchored lines
-      markAnchoredLines(table, lines);
+      const hasAnchorHere = lines.some(lk => parseAnchorKey(lk)?.path === filePath);
+      if (!hasAnchorHere) {
+        return;
+      }
 
-      // Create comment thread element
-      const lineLabels = lines.map(lk => {
-        const [side, num] = lk.split('-');
-        return `${side === 'left' ? 'L' : 'R'}${num}`;
-      }).join(', ');
+      // AC1: Mark anchored lines visible in this table
+      markAnchoredLines(table, filePath, lines);
+
+      // Create comment thread element (labels list all files)
+      const lineLabels = formatGroupedAnchorLabels(lines);
 
       const tr = document.createElement('tr');
       tr.classList.add('multi-anchor-thread');
@@ -388,25 +734,25 @@ Gerrit.install(plugin => {
       tr.querySelector('.ma-resolve-btn').addEventListener('click', (ev) => {
         ev.stopPropagation();
         comment.resolved = !comment.resolved;
-        displaySavedComments(table);
+        refreshCurrentDiffView();
       });
 
       // Discard button handler
       tr.querySelector('.ma-discard-btn').addEventListener('click', (ev) => {
         ev.stopPropagation();
         savedComments.delete(commentId);
-        displaySavedComments(table);
+        refreshCurrentDiffView();
       });
 
       // AC2: Add hover handlers to highlight associated lines (respects persistent toggle)
       tr.addEventListener('mouseenter', () => {
-        highlightCommentLines(table, lines);
+        highlightCommentLines(table, filePath, lines);
       });
 
       tr.addEventListener('mouseleave', () => {
         // Only unhighlight if NOT persistently toggled on
         if (!tr.classList.contains('active-highlight')) {
-          unhighlightCommentLines(table, lines);
+          unhighlightCommentLines(table, filePath, lines);
         }
       });
 
@@ -415,17 +761,17 @@ Gerrit.install(plugin => {
         const isHighlighted = tr.classList.contains('active-highlight');
         if (isHighlighted) {
           tr.classList.remove('active-highlight');
-          unhighlightCommentLines(table, lines);
+          unhighlightCommentLines(table, filePath, lines);
         } else {
           tr.classList.add('active-highlight');
-          highlightCommentLines(table, lines);
+          highlightCommentLines(table, filePath, lines);
         }
       });
 
-      // Insert after the last anchored line
-      const lastLineKey = lines[lines.length - 1];
-      const [side, lineNum] = lastLineKey.split('-');
-      const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
+      // Insert after the last anchored line in *this* file
+      const lastKeyHere = getLastAnchorKeyForFile(lines, filePath);
+      const lastHere = lastKeyHere ? parseAnchorKey(lastKeyHere) : null;
+      const lastRow = findRowForAnchor(table, lastHere);
       if (lastRow) {
         lastRow.insertAdjacentElement('afterend', tr);
       } else {
@@ -458,6 +804,130 @@ Gerrit.install(plugin => {
     }
   }
 
+  function hasDraftRowDeep() {
+    let found = false;
+    walkShadowTree(document.body, (node) => {
+      if (found) {
+        return;
+      }
+      if (node.nodeType === 1 && node.matches && node.matches('tr.multi-anchor-comment-row')) {
+        found = true;
+      }
+    });
+    return found;
+  }
+
+  /**
+   * Finds the first element in composedPath() that matches a selector,
+   * accounting for shadow DOM event retargeting.
+   *
+   * @param {Event} e
+   * @param {string} selector
+   * @returns {Element | null}
+   */
+  function findPathElement(e, selector) {
+    const path = (typeof e.composedPath === 'function') ? e.composedPath() : [e.target];
+    for (const node of path) {
+      if (!node || node.nodeType !== 1) {
+        continue;
+      }
+      if (node.matches && node.matches(selector)) {
+        return node;
+      }
+      if (node.closest) {
+        const match = node.closest(selector);
+        if (match) {
+          return match;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * US1 + US5: Only intercept clicks with Ctrl/Cmd held on any diff table (including
+   * after navigating between files). Paths come from gr-diff-host.
+   */
+  function onDocumentClickCapture(e) {
+    if (!e.ctrlKey && !e.metaKey) {
+      return;
+    }
+    const currentDiffElement = findPathElement(e, 'gr-diff-element') || getDiffElement();
+    ensureStylesInjected(currentDiffElement);
+
+    const table = findPathElement(e, 'table#diffTable');
+    if (!table) {
+      return;
+    }
+
+    const contextNode = findPathElement(e, 'td.left, td.right') || table;
+    const filePath = getFilePathForDiffContext(contextNode);
+    if (!filePath) {
+      return;
+    }
+
+    const row = findPathElement(e, 'tr');
+    if (!row) {
+      return;
+    }
+
+    const sideCell = findPathElement(e, 'td.right, td.left');
+    if (!sideCell) {
+      return;
+    }
+    const side = sideCell.classList.contains('right') ? 'right' : 'left';
+
+    const lineNumCell = row.querySelector(`td.${side}.lineNum`);
+
+    if (!lineNumCell) {
+      return;
+    }
+
+    const lineNum = lineNumCell.dataset.value;
+    if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE') {
+      return;
+    }
+
+    const lineKey = makeAnchorKey(filePath, side, lineNum);
+    toggleLine(lineKey, side, row);
+
+    console.log('Selected lines:', [...selectedLines]);
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  /**
+   * US2: 'c' opens a comment box; Escape dismisses it. Uses capture phase
+   * to intercept before Gerrit's own 'c' shortcut (single-line comment).
+   */
+  function onDocumentKeydownCapture(e) {
+    const tag = e.target.tagName;
+    const activeTag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'TEXTAREA' || tag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'INPUT') {
+      return;
+    }
+
+    if (e.key === 'c' && hasDraftRowDeep()) {
+      return;
+    }
+
+    if (e.key === 'c' && selectedLines.size > 0) {
+      const diffElement = getDiffElement();
+      const { table, filePath } = getTablePathPair(diffElement);
+      if (table && filePath) {
+        console.log('c pressed, showing multi-anchor box');
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        showCommentBox(table, filePath);
+      }
+    }
+
+    if (e.key === 'Escape' && hasDraftRowDeep()) {
+      removeDraftRowsDeep();
+      clearSelectionDeep();
+    }
+  }
+
   /**
    * Attaches click and keyboard listeners to the diff table once it's available.
    * Retries via setTimeout if the diff hasn't rendered yet (Gerrit loads lazily).
@@ -476,85 +946,49 @@ Gerrit.install(plugin => {
       return;
     }
 
-    injectStyles(diffElement);
+    ensureStylesInjected(diffElement);
 
-    const table = diffElement.querySelector('table#diffTable');
-    if (!table) {
+    const { table, filePath } = getTablePathPair(diffElement);
+    if (!table || !filePath) {
       setTimeout(attachListeners, 500);
       return;
     }
 
-    // Display any saved comments on initial load
-    displaySavedComments(table);
+    if (!documentHooksInstalled) {
+      documentHooksInstalled = true;
+      document.addEventListener('click', onDocumentClickCapture, true);
+      document.addEventListener('keydown', onDocumentKeydownCapture, true);
+    }
 
-    // US1 + US5: Only intercept clicks with Ctrl/Cmd held, so normal Gerrit
-    // interactions (single-line comments, navigation) are unaffected.
-    table.addEventListener('click', function (e) {
-      if (!e.ctrlKey && !e.metaKey) {
-        return;
+    // Gerrit can swap the diff element/root between file navigations without
+    // reliably triggering the previous observer. Keep a lightweight poll so
+    // pending selections are rehydrated when returning to a file.
+    if (!attachPollInstalled) {
+      attachPollInstalled = true;
+      setInterval(() => {
+        attachListeners();
+      }, 700);
+    }
+
+    displaySavedComments(table, filePath);
+    const applied = applyPendingSelectionToTable(table, filePath);
+    if (applied === 0 && hasPendingAnchorsForFile(filePath)) {
+      schedulePendingSelectionReapply(filePath, 0);
+    }
+
+    if (diffElement.shadowRoot && observedDiffRoot !== diffElement.shadowRoot) {
+      observedDiffRoot = diffElement.shadowRoot;
+      if (diffObserver) {
+        diffObserver.disconnect();
       }
-
-      const row = e.target.closest('tr');
-      if (!row) {
-        return;
-      }
-
-      const isRight = e.target.closest('td.right') !== null;
-      const isLeft = e.target.closest('td.left') !== null;
-      if (!isRight && !isLeft) {
-        return;
-      }
-
-      const side = isRight ? 'right' : 'left';
-
-      const lineNumCell = row.querySelector(`td.${side}.lineNum`);
-
-      if (!lineNumCell) {
-        return;
-      }
-
-      const lineNum = lineNumCell.dataset.value;
-      if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE') {
-        return;
-      }
-
-      const lineKey = `${side}-${lineNum}`;
-      toggleLine(lineKey, side, row);
-
-      console.log('Selected lines:', [...selectedLines]);
-      e.preventDefault();
-      e.stopPropagation();
-    });
-
-    // US2: 'c' opens a comment box; Escape dismisses it. Uses capture phase
-    // to intercept before Gerrit's own 'c' shortcut (single-line comment).
-    document.addEventListener('keydown', function (e) {
-      // Block if typing in any text field (check both target and active element)
-      const tag = e.target.tagName;
-      const activeTag = document.activeElement && document.activeElement.tagName;
-      if (tag === 'TEXTAREA' || tag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'INPUT') {
-        return;
-      }
-
-      // Also block if a comment box is already open
-      if (e.key === 'c' && table.querySelector('tr.multi-anchor-comment-row')) {
-        return;
-      }
-
-      if (e.key === 'c' && selectedLines.size > 0) {
-        console.log('c pressed, showing multi-anchor box');
-        e.stopImmediatePropagation();
-        e.preventDefault();
-        showCommentBox(table, selectedLines);
-      }
-      if (e.key === 'Escape') {
-        const existing = table.querySelector('tr.multi-anchor-comment-row');
-        if (existing) {
-          existing.remove();
-          clearSelection(table);
-        }
-      }
-    }, true);
+      diffObserver = new MutationObserver(() => {
+        clearTimeout(attachListeners._debounce);
+        attachListeners._debounce = setTimeout(() => {
+          refreshCurrentDiffView();
+        }, 150);
+      });
+      diffObserver.observe(diffElement.shadowRoot, { childList: true, subtree: true });
+    }
   }
 
   setTimeout(attachListeners, 1000);
