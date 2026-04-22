@@ -284,27 +284,45 @@ public class MultiAnchorStorage {
   }
 
   /**
-   * Saves ranges for a specific comment.
+   * Builds the composite storage key for a comment on a specific patchset.
+   *
+   * @param patchSet the patchset number
+   * @param commentUuid the comment UUID
+   * @return the composite key in the format "{patchSet}/{commentUuid}"
+   */
+  private String storageKey(int patchSet, String commentUuid) {
+    return patchSet + "/" + commentUuid;
+  }
+
+  /**
+   * Saves ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number the ranges are scoped to
    * @param commentUuid the comment UUID
    * @param ranges the additional ranges (beyond the primary stored in core Gerrit)
    */
   public void saveRanges(
-      Project.NameKey project, Change.Id changeId, String commentUuid, List<Range> ranges)
+      Project.NameKey project,
+      Change.Id changeId,
+      int patchSet,
+      String commentUuid,
+      List<Range> ranges)
       throws IOException {
     MultiAnchorData data = load(project, changeId);
-    data.setRangesForComment(commentUuid, ranges);
+    data.setRangesForComment(storageKey(patchSet, commentUuid), ranges);
     save(project, changeId, data);
   }
 
   /**
    * Gets all additional ranges for a change.
    *
+   * <p>Returns composite keys in the format "{patchSet}/{commentUuid}".
+   *
    * @param project the project
    * @param changeId the change ID
-   * @return map of comment UUID to additional ranges
+   * @return map of composite key ({patchSet}/{commentUuid}) to additional ranges
    */
   public Map<String, List<Range>> getRanges(Project.NameKey project, Change.Id changeId)
       throws IOException {
@@ -312,30 +330,35 @@ public class MultiAnchorStorage {
   }
 
   /**
-   * Gets additional ranges for a specific comment.
+   * Gets additional ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number
    * @param commentUuid the comment UUID
    * @return list of additional ranges, or empty list if none
    */
   public List<Range> getRangesForComment(
-      Project.NameKey project, Change.Id changeId, String commentUuid) throws IOException {
-    return load(project, changeId).getRangesForComment(commentUuid);
+      Project.NameKey project, Change.Id changeId, int patchSet, String commentUuid)
+      throws IOException {
+    return load(project, changeId).getRangesForComment(storageKey(patchSet, commentUuid));
   }
 
   /**
-   * Deletes ranges for a specific comment.
+   * Deletes ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number
    * @param commentUuid the comment UUID
    */
-  public void deleteRanges(Project.NameKey project, Change.Id changeId, String commentUuid)
+  public void deleteRanges(
+      Project.NameKey project, Change.Id changeId, int patchSet, String commentUuid)
       throws IOException {
+    String key = storageKey(patchSet, commentUuid);
     MultiAnchorData data = load(project, changeId);
-    if (data.hasRangesForComment(commentUuid)) {
-      data.removeComment(commentUuid);
+    if (data.hasRangesForComment(key)) {
+      data.removeComment(key);
       save(project, changeId, data);
     }
   }

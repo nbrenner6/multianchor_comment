@@ -117,8 +117,9 @@ Gerrit.install(plugin => {
   /**
    * Saves additional ranges for a comment via plugin API.
    */
-  async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+  async function saveAdditionalRanges(changeNum, patchSet, commentUuid, ranges) {
+    const compositeId = `${patchSet}~${commentUuid}`;
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${compositeId}`;
     const body = { ranges: ranges };
     return await restApi.put(endpoint, body);
   }
@@ -126,16 +127,18 @@ Gerrit.install(plugin => {
   /**
    * Gets additional ranges for a comment via plugin API.
    */
-  async function getAdditionalRanges(changeNum, commentUuid) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+  async function getAdditionalRanges(changeNum, patchSet, commentUuid) {
+    const compositeId = `${patchSet}~${commentUuid}`;
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${compositeId}`;
     return restApi.get(endpoint);
   }
 
   /**
    * Deletes additional ranges for a comment via plugin API.
    */
-  async function deleteAdditionalRanges(changeNum, commentUuid) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
+  async function deleteAdditionalRanges(changeNum, patchSet, commentUuid) {
+    const compositeId = `${patchSet}~${commentUuid}`;
+    const endpoint = `/changes/${changeNum}/multianchor-ranges/${compositeId}`;
     return restApi.delete(endpoint);
   }
 
@@ -166,7 +169,10 @@ Gerrit.install(plugin => {
       for (const [path, comments] of Object.entries(drafts || {})) {
         for (const comment of comments) {
           const uuid = comment.id;
-          const extraRanges = additionalRanges[uuid] || [];
+
+          // Build the composite key used in plugin storage: "{patchSet}/{uuid}"
+          const compositeKey = `${patchSet}/${uuid}`;
+          const extraRanges = additionalRanges[compositeKey] || [];
 
           // Only include comments that have additional ranges (multi-anchor)
           if (extraRanges.length > 0) {
@@ -237,7 +243,7 @@ Gerrit.install(plugin => {
       // 2. If there are additional ranges, save them via plugin API
       if (allRanges.length > 1) {
         const additionalRanges = allRanges.slice(1);
-        await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
+        await saveAdditionalRanges(changeNum, patchSet, draft.id, additionalRanges);
       }
 
       // 3. Add to local cache
@@ -273,7 +279,7 @@ Gerrit.install(plugin => {
       await deleteDraft(changeNum, patchSet, commentId);
 
       // 2. Delete additional ranges from plugin storage
-      await deleteAdditionalRanges(changeNum, commentId);
+      await deleteAdditionalRanges(changeNum, patchSet, commentId);
 
       // 3. Remove from local cache
       savedComments.delete(commentId);

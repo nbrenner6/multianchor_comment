@@ -27,9 +27,9 @@ import com.googlesource.gerrit.plugins.multianchorcomment.rest.SaveMultiAnchorRa
  *
  * <ul>
  *   <li>GET /changes/{id}/multianchor-ranges - List all ranges for a change
- *   <li>GET /changes/{id}/multianchor-ranges/{uuid} - Get ranges for a comment
- *   <li>PUT /changes/{id}/multianchor-ranges/{uuid} - Save ranges for a comment
- *   <li>DELETE /changes/{id}/multianchor-ranges/{uuid} - Delete ranges for a comment
+ *   <li>GET /changes/{id}/multianchor-ranges/{patchSet}~{uuid} - Get ranges for a comment
+ *   <li>PUT /changes/{id}/multianchor-ranges/{patchSet}~{uuid} - Save ranges for a comment
+ *   <li>DELETE /changes/{id}/multianchor-ranges/{patchSet}~{uuid} - Delete ranges for a comment
  * </ul>
  */
 public class PluginModule extends RestApiModule {
@@ -47,7 +47,7 @@ public class PluginModule extends RestApiModule {
     child(CHANGE_KIND, "multianchor-ranges").to(MultiAnchorRangesCollection.class);
 
     // Register CRUD operations for individual comment ranges
-    // These enable: /changes/{changeId}/multianchor-ranges/{commentUuid}
+    // These enable: /changes/{changeId}/multianchor-ranges/{patchSet}~{commentUuid}
     get(MULTIANCHOR_RANGES_KIND).to(GetMultiAnchorRanges.class);
     put(MULTIANCHOR_RANGES_KIND).to(SaveMultiAnchorRanges.class);
     delete(MULTIANCHOR_RANGES_KIND).to(DeleteMultiAnchorRanges.class);

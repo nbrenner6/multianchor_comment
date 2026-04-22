@@ -10,7 +10,7 @@ import java.io.IOException;
 /**
  * REST endpoint for deleting additional ranges for a comment.
  *
- * <p>DELETE /changes/{changeId}/multianchor-ranges/{commentUuid}
+ * <p>DELETE /changes/{changeId}/multianchor-ranges/{patchSet}~{commentUuid}
  *
  * <p>Removes all additional anchor ranges for the specified comment. This should be called when a
  * comment is deleted from Gerrit to clean up the plugin's storage.
@@ -36,7 +36,8 @@ public class DeleteMultiAnchorRanges
 
   @Override
   public Response<?> apply(MultiAnchorRangesResource rsrc, Input input) throws IOException {
-    storage.deleteRanges(rsrc.getProject(), rsrc.getChangeId(), rsrc.getCommentUuid());
+    storage.deleteRanges(
+        rsrc.getProject(), rsrc.getChangeId(), rsrc.getPatchSet(), rsrc.getCommentUuid());
     return Response.none();
   }
 }
