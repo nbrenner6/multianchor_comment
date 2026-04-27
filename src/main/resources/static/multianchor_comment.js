@@ -20,25 +20,34 @@ Gerrit.install(plugin => {
   /**
    * Gets the current change number from the URL.
    * URL format: /c/PROJECT/+/CHANGE_NUMBER/[PATCHSET]/[FILE]
+   * Supports multi-segment project names (e.g., myorg/myrepo).
    */
   function getChangeNumber() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/(\d+)/);
-    return match ? match[1] : null;
+    const match = window.location.pathname.match(/\/c\/(.+?)\/\+\/(\d+)/);
+    return match ? match[2] : null;
   }
 
   /**
    * Gets the current patchset number from the URL.
+   * Returns 'current' if patchset is not specified.
    */
   function getPatchSetNumber() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/(\d+)/);
+    const match = window.location.pathname.match(/\/c\/.+?\/\+\/\d+\/(\d+)/);
     return match ? match[1] : 'current';
   }
 
   /**
    * Gets the current file path from the URL.
+   * Supports URLs with or without explicit patchset number.
    */
   function getFilePath() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/\d+\/(.+)/);
+    // Try with patchset number first
+    let match = window.location.pathname.match(/\/c\/.+?\/\+\/\d+\/\d+\/(.+)/);
+    if (match) {
+      return decodeURIComponent(match[1]);
+    }
+    // Try without patchset number (uses 'current')
+    match = window.location.pathname.match(/\/c\/.+?\/\+\/\d+\/([^0-9].*)$/);
     return match ? decodeURIComponent(match[1]) : null;
   }
 
@@ -88,20 +97,48 @@ Gerrit.install(plugin => {
   /**
    * Creates a draft comment via Gerrit's native API.
    * Note: Gerrit uses PUT (not POST) to create draft comments.
-   * For whole-line selections, we only send 'line' (no range).
+   * Preserves full range information for multi-line selections.
+   * @param {string} changeNum - The change number
+   * @param {string} patchSet - The patchset number
+   * @param {string} path - The file path
+   * @param {Object} range - The range object with start_line, start_character, end_line, end_character
+   * @param {string} message - The comment message
+   * @param {boolean} unresolved - Whether the comment is unresolved
+   * @param {string} side - 'PARENT' for left side, 'REVISION' for right side (optional)
    * @returns {Promise<Object>} The created comment info
    */
-  async function createDraft(changeNum, patchSet, path, range, message, unresolved) {
+  async function createDraft(changeNum, patchSet, path, range, message, unresolved, side) {
     const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
 
-    // For whole-line selections (startChar=0, endChar=0), don't send a range
-    // Just use the line number like native Gerrit comments
     const body = {
       path: path,
-      line: range.end_line,
       message: message,
       unresolved: unresolved
     };
+
+    // Include side if specified (PARENT for left, REVISION for right)
+    if (side === 'left') {
+      body.side = 'PARENT';
+    }
+
+    // For whole-line selections (startChar=0, endChar=0, single line), use line only
+    // For multi-line or character-specific selections, include the full range
+    const isWholeLineSingleLine =
+      range.start_line === range.end_line &&
+      range.start_character === 0 &&
+      range.end_character === 0;
+
+    if (isWholeLineSingleLine) {
+      body.line = range.start_line;
+    } else {
+      body.line = range.start_line;
+      body.range = {
+        start_line: range.start_line,
+        start_character: range.start_character,
+        end_line: range.end_line,
+        end_character: range.end_character
+      };
+    }
 
     return restApi.put(endpoint, body);
   }
@@ -137,6 +174,19 @@ Gerrit.install(plugin => {
   async function deleteAdditionalRanges(changeNum, commentUuid) {
     const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
     return restApi.delete(endpoint);
+  }
+
+  /**
+   * Updates a draft comment's resolved state via Gerrit's native API.
+   * @param {string} changeNum - The change number
+   * @param {string} patchSet - The patchset number
+   * @param {string} draftId - The draft comment ID
+   * @param {boolean} resolved - Whether the comment should be resolved
+   * @returns {Promise<Object>} The updated comment info
+   */
+  async function updateDraftResolved(changeNum, patchSet, draftId, resolved) {
+    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`;
+    return restApi.put(endpoint, { unresolved: !resolved });
   }
 
   /**
@@ -207,6 +257,8 @@ Gerrit.install(plugin => {
 
   /**
    * Creates a multi-anchor comment (draft + additional ranges).
+   * Implements compensation logic for atomicity: if saveAdditionalRanges fails,
+   * the draft is deleted to avoid inconsistent state.
    */
   async function createMultiAnchorComment(selectedLines, message, resolved) {
     const changeNum = getChangeNumber();
@@ -229,15 +281,27 @@ Gerrit.install(plugin => {
       return null;
     }
 
+    let draft = null;
     try {
       // 1. Create draft with primary (first) range via Gerrit API
       const primaryRange = allRanges[0];
-      const draft = await createDraft(changeNum, patchSet, path, primaryRange, message, !resolved);
+      draft = await createDraft(changeNum, patchSet, path, primaryRange, message, !resolved, side);
 
       // 2. If there are additional ranges, save them via plugin API
       if (allRanges.length > 1) {
         const additionalRanges = allRanges.slice(1);
-        await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
+        try {
+          await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
+        } catch (rangeError) {
+          // Compensation: delete the draft to maintain consistency
+          console.error('Failed to save additional ranges, compensating by deleting draft:', rangeError);
+          try {
+            await deleteDraft(changeNum, patchSet, draft.id);
+          } catch (deleteError) {
+            console.error('Compensation delete failed:', deleteError);
+          }
+          throw rangeError;
+        }
       }
 
       // 3. Add to local cache
@@ -253,12 +317,15 @@ Gerrit.install(plugin => {
 
       return draft;
     } catch (error) {
+      console.error('Failed to create multi-anchor comment:', error);
       return null;
     }
   }
 
   /**
    * Deletes a multi-anchor comment (draft + additional ranges).
+   * Implements retry logic for atomicity: if deleteAdditionalRanges fails,
+   * retries with backoff and logs the partial failure.
    */
   async function deleteMultiAnchorComment(commentId) {
     const changeNum = getChangeNumber();
@@ -268,18 +335,44 @@ Gerrit.install(plugin => {
       return false;
     }
 
+    // Store comment data for potential restoration
+    const commentData = savedComments.get(commentId);
+
     try {
       // 1. Delete draft from Gerrit first
       await deleteDraft(changeNum, patchSet, commentId);
 
-      // 2. Delete additional ranges from plugin storage
-      await deleteAdditionalRanges(changeNum, commentId);
+      // 2. Delete additional ranges from plugin storage with retry
+      let rangeDeleteSuccess = false;
+      let lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await deleteAdditionalRanges(changeNum, commentId);
+          rangeDeleteSuccess = true;
+          break;
+        } catch (rangeError) {
+          lastError = rangeError;
+          console.warn(`Attempt ${attempt + 1} to delete additional ranges failed:`, rangeError);
+          if (attempt < 2) {
+            // Wait before retry (exponential backoff: 100ms, 200ms)
+            await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+          }
+        }
+      }
+
+      if (!rangeDeleteSuccess) {
+        // Log partial failure - draft deleted but ranges remain (orphaned)
+        console.error('Partial delete: draft deleted but additional ranges remain:', lastError);
+        // Still consider this a success for the user since the draft is gone
+        // The orphaned range data will be ignored since it references a non-existent comment
+      }
 
       // 3. Remove from local cache
       savedComments.delete(commentId);
 
       return true;
     } catch (error) {
+      console.error('Failed to delete multi-anchor comment:', error);
       return false;
     }
   }
@@ -593,6 +686,7 @@ Gerrit.install(plugin => {
    *
    * US3: Re-renders all saved comment threads and their associated line markers.
    * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
+   * Only displays comments for the current file path.
    *
    * @param {*} table - Gerrit diff table
    */
@@ -608,9 +702,17 @@ Gerrit.install(plugin => {
       td.classList.remove('multi-anchor-highlighted');
     });
 
-    // Display each saved comment
+    // Get current file path to filter comments
+    const currentPath = getFilePath();
+
+    // Display each saved comment (only for current file)
     savedComments.forEach((comment, commentId) => {
-      const { lines, text, resolved } = comment;
+      const { lines, text, resolved, path } = comment;
+
+      // Skip comments not belonging to the current file
+      if (path !== currentPath) {
+        return;
+      }
 
       // AC1: Mark all anchored lines
       markAnchoredLines(table, lines);
@@ -658,11 +760,31 @@ Gerrit.install(plugin => {
         </td>
       `;
 
-      // Resolve button handler
-      tr.querySelector('.ma-resolve-btn').addEventListener('click', (ev) => {
+      // Resolve button handler - persists the resolved state to the backend
+      tr.querySelector('.ma-resolve-btn').addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        comment.resolved = !comment.resolved;
+
+        const btn = tr.querySelector('.ma-resolve-btn');
+        const originalText = btn.textContent;
+        const newResolved = !comment.resolved;
+
+        // Optimistic UI update
+        comment.resolved = newResolved;
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
         displaySavedComments(table);
+
+        try {
+          const changeNum = getChangeNumber();
+          const patchSet = getPatchSetNumber();
+          await updateDraftResolved(changeNum, patchSet, commentId, newResolved);
+          // Success - UI already updated optimistically
+        } catch (error) {
+          // Revert on failure
+          console.error('Failed to update resolved state:', error);
+          comment.resolved = !newResolved;
+          displaySavedComments(table);
+        }
       });
 
       // Discard button handler
