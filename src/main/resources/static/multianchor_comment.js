@@ -36,6 +36,33 @@ Gerrit.install(plugin => {
     return match ? match[1] : 'current';
   }
 
+  /** Cache so we do not refetch change detail on every operation while the URL still implies "current". */
+  let effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
+
+  /**
+   * Returns the patchset string to use for APIs and storage keys.
+   * When the URL omits a revision, Gerrit uses "current" for draft endpoints, but plugin storage
+   * keys use numeric patchset numbers; this resolves "current" via change detail.
+   */
+  async function getEffectivePatchSetNumber(changeNum) {
+    const urlToken = getPatchSetNumber();
+    if (urlToken !== 'current') {
+      return urlToken;
+    }
+    if (
+      effectivePatchSetCache.changeNum === changeNum &&
+      effectivePatchSetCache.urlToken === urlToken &&
+      effectivePatchSetCache.resolved != null
+    ) {
+      return effectivePatchSetCache.resolved;
+    }
+    const detail = await restApi.get(`/changes/${changeNum}/detail`);
+    const rev = detail.revisions[detail.current_revision];
+    const resolved = String(rev._number);
+    effectivePatchSetCache = { changeNum, urlToken, resolved };
+    return resolved;
+  }
+
   /**
    * Gets the current file path from the URL.
    * Supports URLs with or without explicit patchset number.
@@ -203,8 +230,9 @@ Gerrit.install(plugin => {
   /**
    * Loads all drafts and their additional ranges.
    */
-  async function loadMultiAnchorComments(changeNum, patchSet) {
+  async function loadMultiAnchorComments(changeNum) {
     try {
+      const patchSet = await getEffectivePatchSetNumber(changeNum);
       // Get all drafts from Gerrit
       const draftsEndpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
       const drafts = await restApi.get(draftsEndpoint);
@@ -268,12 +296,13 @@ Gerrit.install(plugin => {
    */
   async function createMultiAnchorComment(selectedLines, message, resolved) {
     const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
     const path = getFilePath();
 
     if (!changeNum || !path) {
       return null;
     }
+
+    const patchSet = await getEffectivePatchSetNumber(changeNum);
 
     // Determine which side has the most selections
     const rightLines = [...selectedLines].filter(k => k.startsWith('right'));
@@ -335,11 +364,12 @@ Gerrit.install(plugin => {
    */
   async function deleteMultiAnchorComment(commentId) {
     const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
 
     if (!changeNum) {
       return false;
     }
+
+    const patchSet = await getEffectivePatchSetNumber(changeNum);
 
     // Store comment data for potential restoration
     const commentData = savedComments.get(commentId);
@@ -782,7 +812,7 @@ Gerrit.install(plugin => {
 
         try {
           const changeNum = getChangeNumber();
-          const patchSet = getPatchSetNumber();
+          const patchSet = await getEffectivePatchSetNumber(changeNum);
           await updateDraftResolved(changeNum, patchSet, commentId, newResolved);
           // Success - UI already updated optimistically
         } catch (error) {
@@ -958,9 +988,9 @@ Gerrit.install(plugin => {
 
     // Load and display comments from backend on initial load
     const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
     if (changeNum) {
-      loadMultiAnchorComments(changeNum, patchSet).then(() => {
+      effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
+      loadMultiAnchorComments(changeNum).then(() => {
         displaySavedComments(table);
         setupNativeThreadHider();
       });

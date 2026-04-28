@@ -69,12 +69,17 @@ public class MultiAnchorRangesCollection
           "Invalid ID format. Expected {patchSet}~{commentUuid}, got: " + compositeId);
     }
 
+    String patchSetSegment = compositeId.substring(0, separatorIndex);
     int patchSet;
-    try {
-      patchSet = Integer.parseInt(compositeId.substring(0, separatorIndex));
-    } catch (NumberFormatException e) {
-      throw new ResourceNotFoundException(
-          "Invalid patchset number in ID: " + compositeId);
+    if (patchSetSegment.equalsIgnoreCase("current")) {
+      patchSet = parent.getChange().currentPatchSetId().get();
+    } else {
+      try {
+        patchSet = Integer.parseInt(patchSetSegment);
+      } catch (NumberFormatException e) {
+        throw new ResourceNotFoundException(
+            "Invalid patchset number in ID: " + compositeId);
+      }
     }
     if (patchSet <= 0) {
       throw new ResourceNotFoundException(
