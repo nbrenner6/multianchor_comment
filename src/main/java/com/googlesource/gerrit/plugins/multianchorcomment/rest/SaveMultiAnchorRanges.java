@@ -94,6 +94,9 @@ public class SaveMultiAnchorRanges
     // Validate and convert all ranges
     List<Range> ranges = new ArrayList<>();
     for (RangeInput rangeInput : input.ranges) {
+      if (rangeInput == null) {
+        throw new BadRequestException("Null range element");
+      }
       if (!rangeInput.isValid()) {
         throw new BadRequestException(
             String.format(
