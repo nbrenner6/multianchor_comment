@@ -11,11 +11,107 @@
  */
 Gerrit.install(plugin => {
 
+  // ── User-testing logger ────────────────────────────────────────────────────
+  /**
+   * Structured logger for user-testing analytics.
+   *
+   * Every event is written to:
+   *   1. console.log  – standard DevTools console (filterable by "[MA]")
+   *   2. sessionStorage["ma_plugin_log"] – JSON array persisted for the tab
+   *      (survives page reloads within the same tab session; copy via
+   *       JSON.parse(sessionStorage.getItem('ma_plugin_log')) in DevTools)
+   *
+   * Event schema:
+   *   { ts, isoTs, event, category, data }
+   *
+   * Categories: session | anchor | comment | ai | ui | error
+   */
+  const MALog = (() => {
+    const SESSION_KEY = 'ma_plugin_log';
+    const SESSION_ID  = `s_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+    function _persist(entry) {
+      try {
+        const raw  = sessionStorage.getItem(SESSION_KEY);
+        const arr  = raw ? JSON.parse(raw) : [];
+        arr.push(entry);
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify(arr));
+      } catch (e) {
+        // sessionStorage full or unavailable – silent fail
+      }
+    }
+
+    function _emit(category, event, data = {}) {
+      const now   = Date.now();
+      const entry = {
+        ts:       now,
+        isoTs:    new Date(now).toISOString(),
+        sessionId: SESSION_ID,
+        category,
+        event,
+        data,
+      };
+      // Console output: easy to grep with "[MA]" in DevTools
+      console.log(`[MA] [${category.toUpperCase()}] ${event}`, data);
+      _persist(entry);
+      return entry;
+    }
+
+    return {
+      sessionId: SESSION_ID,
+
+      // ── Session events ─────────────────────────────────────────────────
+      session(event, data)  { return _emit('session',  event, data); },
+
+      // ── Anchor-selection events ────────────────────────────────────────
+      anchor(event, data)   { return _emit('anchor',   event, data); },
+
+      // ── Comment lifecycle events ───────────────────────────────────────
+      comment(event, data)  { return _emit('comment',  event, data); },
+
+      // ── AI-review events ───────────────────────────────────────────────
+      ai(event, data)       { return _emit('ai',       event, data); },
+
+      // ── UI / navigation events ─────────────────────────────────────────
+      ui(event, data)       { return _emit('ui',       event, data); },
+
+      // ── Error events ───────────────────────────────────────────────────
+      error(event, data)    { return _emit('error',    event, data); },
+
+      /**
+       * Returns a copy of the full log array from sessionStorage.
+       * Useful for exporting during/after a test session.
+       */
+      export() {
+        try {
+          return JSON.parse(sessionStorage.getItem(SESSION_KEY) || '[]');
+        } catch { return []; }
+      },
+
+      /**
+       * Clears the persisted log (e.g. between test runs).
+       */
+      clear() {
+        sessionStorage.removeItem(SESSION_KEY);
+        console.log('[MA] Log cleared.');
+      },
+    };
+  })();
+
+  // Expose on window so testers can call MALog.export() / MALog.clear() in DevTools
+  window.MALog = MALog;
+
+  MALog.session('plugin_init', {
+    url:       window.location.href,
+    userAgent: navigator.userAgent,
+  });
+
   // ── REST helper ────────────────────────────────────────────────────────────
   const restApi = plugin.restApi();
 
   // ── In-memory store ────────────────────────────────────────────────────────
   const savedComments = new Map();
+  const managedGerritIds = new Set(); // raw Gerrit draft IDs, e.g. "30cf37cd_63ac1f2c"
 
   // ── URL helpers ────────────────────────────────────────────────────────────
   function getChangeNumber() {
@@ -29,6 +125,22 @@ Gerrit.install(plugin => {
   function getFilePath() {
     const m = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/\d+\/(.+)/);
     return m ? decodeURIComponent(m[1]) : null;
+  }
+  function toPluginUrlId(rawGerritId, patchSet) {
+    // rawGerritId is the full Gerrit draft ID, e.g. "57c51203_e734edd9"
+    // The backend splits on '~' to get patchSet and commentUuid
+    return `${patchSet}~${rawGerritId}`;
+  }
+
+  // Storage key for looking up in getAllAdditionalRanges response: {patchSet}/{rawGerritDraftId}
+  function toPluginStorageKey(rawGerritId, patchSet) {
+    if (!rawGerritId) return rawGerritId;
+    return `${patchSet}/${rawGerritId}`;
+  }
+
+  function toGerritDraftId(storageKey) {
+    // Storage key is "1/57c51203_e734edd9" — Gerrit wants "57c51203_e734edd9"
+    return storageKey.includes('/') ? storageKey.split('/').slice(1).join('/') : storageKey;
   }
 
   // ── Effective patchset resolution ──────────────────────────────────────────
@@ -58,11 +170,20 @@ Gerrit.install(plugin => {
     ) {
       return effectivePatchSetCache.resolved;
     }
-    const detail = await restApi.get(`/changes/${changeNum}/detail`);
-    const rev = detail.revisions[detail.current_revision];
-    const resolved = String(rev._number);
-    effectivePatchSetCache = { changeNum, urlToken, resolved };
-    return resolved;
+    try {
+      const detail = await restApi.get(`/changes/${changeNum}/detail`);
+      const rev = detail.revisions[detail.current_revision];
+      const resolved = String(rev._number);
+      effectivePatchSetCache = { changeNum, urlToken, resolved };
+      return resolved;
+    } catch (e) {
+      console.error('[MA] getEffectivePatchSetNumber failed — falling back to "current":', e);
+      MALog.error('patchset_resolve_failed', {
+        changeNum,
+        error: e?.message || String(e),
+      });
+      return 'current'; // Gerrit draft endpoints accept "current" as a fallback
+    }
   }
 
   // ── Prompt history (localStorage) ─────────────────────────────────────────
@@ -240,6 +361,7 @@ Gerrit.install(plugin => {
   }
 
   async function updateDraft(changeNum, patchSet, draftId, message, unresolved) {
+    console.log(`[MA] updateDraft: change=${changeNum} ps=${patchSet} id=${draftId}`);
     const existing = await restApi.get(
       `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`
     );
@@ -254,12 +376,13 @@ Gerrit.install(plugin => {
   }
 
   // ── REST: Plugin multi-anchor storage ─────────────────────────────────────
-  async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
-    return restApi.put(`/changes/${changeNum}/multianchor-ranges/${commentUuid}`, { ranges });
+  async function saveAdditionalRanges(changeNum, urlId, ranges) {
+    return restApi.put(`/changes/${changeNum}/multianchor-ranges/${urlId}`, { ranges });
   }
-  async function deleteAdditionalRanges(changeNum, commentUuid) {
-    return restApi.delete(`/changes/${changeNum}/multianchor-ranges/${commentUuid}`);
+  async function deleteAdditionalRanges(changeNum, urlId) {
+    return restApi.delete(`/changes/${changeNum}/multianchor-ranges/${urlId}`);
   }
+
   async function getAllAdditionalRanges(changeNum) {
     return restApi.get(`/changes/${changeNum}/multianchor-ranges`);
   }
@@ -292,8 +415,13 @@ Gerrit.install(plugin => {
 
   // ── Load multi-anchor comments from backend ────────────────────────────────
   const AI_PREFIX = '🤖 AI Review:';
+  let commentsLoading = false;
+  let commentsLoaded  = false;
 
   async function loadMultiAnchorComments(changeNum, patchSet) {
+    commentsLoading = true;
+    commentsLoaded  = false;
+    MALog.session('load_comments_start', { changeNum, patchSet });
     try {
       const [drafts, additionalRanges] = await Promise.all([
         restApi.get(`/changes/${changeNum}/revisions/${patchSet}/drafts`),
@@ -301,15 +429,20 @@ Gerrit.install(plugin => {
       ]);
 
       savedComments.clear();
+      managedGerritIds.clear();
+
+      let loadedCount = 0;
+      let aiCount     = 0;
+      let multiCount  = 0;
 
       for (let [path, comments] of Object.entries(drafts || {})) {
         path = path.replace(/^\[(.+?)\]\(.+?\)$/, '$1');
-        for (const comment of comments) {
-          const uuid        = comment.id;
-          const extraRanges = additionalRanges[uuid] || [];
+         for (const comment of comments) {
+          const storageKey = toPluginStorageKey(comment.id, patchSet);
+          const extraRanges = additionalRanges[storageKey] || [];
           const isAiComment = comment.message?.startsWith(AI_PREFIX);
-
-          if (extraRanges.length === 0 && !isAiComment) continue;
+          const isPluginManaged = storageKey in (additionalRanges || {});
+          if (!isPluginManaged && !isAiComment) continue;
 
           const primaryRange = comment.range ||
             (comment.line
@@ -330,21 +463,45 @@ Gerrit.install(plugin => {
 
           if (lines.length === 0) continue;
 
-          savedComments.set(uuid, {
-            id: uuid,
+          savedComments.set(storageKey, {
+            id: storageKey,
             path,
             lines,
-            text:             comment.message,
-            resolved:         comment.unresolved === false,
-            isDraft:          true,
+            text: comment.message,
+            resolved: comment.unresolved === false,
+            isDraft: true,
             primaryRange,
             additionalRanges: extraRanges,
           });
+
+          managedGerritIds.add(comment.id);
+
+          loadedCount++;
+          if (isAiComment) aiCount++;
+          if (extraRanges.length > 0) multiCount++;
         }
       }
+
+      MALog.session('load_comments_complete', {
+        changeNum,
+        patchSet,
+        totalLoaded:    loadedCount,
+        aiComments:     aiCount,
+        multiAnchorComments: multiCount,
+      });
+
+      lastLoadTs = Date.now();
       return savedComments;
     } catch (e) {
+      MALog.error('load_comments_failed', {
+        changeNum,
+        patchSet,
+        error: e?.message || String(e),
+      });
       return savedComments;
+    } finally {
+      commentsLoading = false;
+      commentsLoaded  = true;
     }
   }
 
@@ -376,31 +533,69 @@ Gerrit.install(plugin => {
     const allRanges = anchorKeysToRanges(selectedLines, side);
     if (!allRanges.length) return null;
 
+    // Compute per-file anchor breakdown for logging
+    const anchorsByFile = {};
+    selectedLines.forEach(k => {
+      const a = parseAnchorKey(k);
+      if (!a) return;
+      if (!anchorsByFile[a.path]) anchorsByFile[a.path] = [];
+      anchorsByFile[a.path].push({ side: a.side, line: a.lineNum });
+    });
+    const isMultiFile  = Object.keys(anchorsByFile).length > 1;
+    const isMultiRange = allRanges.length > 1;
+
+    MALog.comment('create_start', {
+      changeNum,
+      patchSet,
+      primaryPath:    path,
+      anchorCount:    selectedLines.size,
+      fileCount:      Object.keys(anchorsByFile).length,
+      isMultiFile,
+      isMultiRange,
+      rangeCount:     allRanges.length,
+      resolved,
+      messageLength:  message.length,
+      anchorsByFile,
+    });
+
     let draft = null;
+    let fullDraftId = null;
     try {
       // 1. Create draft with primary (first) range via Gerrit API
       draft = await createDraft(changeNum, patchSet, path, allRanges[0], message, !resolved);
 
+      fullDraftId = toPluginStorageKey(draft.id, patchSet);
+      const urlId = toPluginUrlId(draft.id, patchSet);
+
       // 2. If there are additional ranges, save them via plugin API
-      if (allRanges.length > 1) {
-        const additionalRanges = allRanges.slice(1);
+      const additionalRanges = allRanges.slice(1);
+      try {
+        await saveAdditionalRanges(changeNum, urlId, additionalRanges);
+      } catch (rangeError) {
+        // Compensation: delete the draft to maintain consistency
+        console.error('Failed to save additional ranges, compensating by deleting draft:', rangeError);
+        MALog.error('create_additional_ranges_failed', {
+          commentId: draft.id,
+          changeNum,
+          patchSet,
+          error: rangeError?.message || String(rangeError),
+          compensating: true,
+        });
         try {
-          await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
-        } catch (rangeError) {
-          // Compensation: delete the draft to maintain consistency
-          console.error('Failed to save additional ranges, compensating by deleting draft:', rangeError);
-          try {
-            await deleteDraft(changeNum, patchSet, draft.id);
-          } catch (deleteError) {
-            console.error('Compensation delete failed:', deleteError);
-          }
-          throw rangeError;
+          await deleteDraft(changeNum, patchSet, draft.id);
+        } catch (deleteError) {
+          console.error('Compensation delete failed:', deleteError);
+          MALog.error('create_compensation_delete_failed', {
+            commentId: draft.id,
+            error: deleteError?.message || String(deleteError),
+          });
         }
+        throw rangeError;
       }
 
       // 3. Add to local cache
-      savedComments.set(draft.id, {
-        id:               draft.id,
+      savedComments.set(fullDraftId, {
+        id:               fullDraftId,
         path,
         lines:            [...selectedLines],
         text:             message,
@@ -409,11 +604,38 @@ Gerrit.install(plugin => {
         primaryRange:     allRanges[0],
         additionalRanges: allRanges.slice(1),
       });
-      return draft;
-    } catch (error) {
-      console.error('Failed to create multi-anchor comment:', error);
-      return null;
-    }
+
+      managedGerritIds.add(draft.id);
+
+      lastLoadTs = Date.now(); // suppress poll reload until backend is consistent
+
+      MALog.comment('create_success', {
+        commentId:      draft.id,
+        changeNum,
+        patchSet,
+        primaryPath:    path,
+        anchorCount:    selectedLines.size,
+        fileCount:      Object.keys(anchorsByFile).length,
+        isMultiFile,
+        isMultiRange,
+        rangeCount:     allRanges.length,
+        resolved,
+        messageLength:  message.length,
+        messagePreview: message.slice(0, 80),
+        anchorsByFile,
+      });
+
+     return { draft, error: null };
+      } catch (error) {
+        console.error('[MA] createMultiAnchorComment failed:', error);
+        MALog.error('create_failed', {
+          changeNum,
+          patchSet,
+          primaryPath: path,
+          error: error?.message || String(error),
+        });
+        return { draft: null, error };
+      }
   }
 
   /**
@@ -426,16 +648,30 @@ Gerrit.install(plugin => {
     const patchSet  = await getEffectivePatchSetNumber(changeNum);
     if (!changeNum) return false;
 
+    const commentMeta = savedComments.get(commentId);
+    MALog.comment('delete_start', {
+      commentId,
+      changeNum,
+      patchSet,
+      path:        commentMeta?.path,
+      anchorCount: commentMeta?.lines?.length,
+      isAi:        commentMeta?.text?.startsWith(AI_PREFIX),
+    });
+
     try {
       // 1. Delete draft from Gerrit first
-      await deleteDraft(changeNum, patchSet, commentId);
+      const rawGerritId = commentId.includes('/') ? commentId.split('/').slice(1).join('/') : commentId;
+      const urlId = toPluginUrlId(rawGerritId, patchSet);
+      const gerritId = rawGerritId; // Gerrit draft endpoint wants the raw ID as-is
+
+      await deleteDraft(changeNum, patchSet, gerritId);
 
       // 2. Delete additional ranges from plugin storage with retry
       let rangeDeleteSuccess = false;
       let lastError = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          await deleteAdditionalRanges(changeNum, commentId);
+          await deleteAdditionalRanges(changeNum, urlId);
           rangeDeleteSuccess = true;
           break;
         } catch (rangeError) {
@@ -453,13 +689,34 @@ Gerrit.install(plugin => {
         // Still treat as success for the user since the draft is gone; the
         // orphaned range data is harmless (references a non-existent comment).
         console.error('Partial delete: draft deleted but additional ranges remain:', lastError);
+        MALog.error('delete_partial_ranges_orphaned', {
+          commentId,
+          changeNum,
+          patchSet,
+          error: lastError?.message || String(lastError),
+        });
       }
 
       // 3. Remove from local cache
       savedComments.delete(commentId);
+      managedGerritIds.delete(toGerritDraftId(commentId));
+
+      MALog.comment('delete_success', {
+        commentId,
+        changeNum,
+        patchSet,
+        rangesAlsoDeleted: rangeDeleteSuccess,
+      });
+
       return true;
     } catch (error) {
       console.error('Failed to delete multi-anchor comment:', error);
+      MALog.error('delete_failed', {
+        commentId,
+        changeNum,
+        patchSet,
+        error: error?.message || String(error),
+      });
       return false;
     }
   }
@@ -653,15 +910,29 @@ Gerrit.install(plugin => {
   let logEl   = null;
 
   function injectAiPanel() {
+    if (document.getElementById('ma-ai-fab-wrapper')) return;
     if (document.getElementById('ma-ai-fab')) return;
 
     // FAB
+    const fabWrapper = document.createElement('div');
+    fabWrapper.id = 'ma-ai-fab-wrapper';
+    Object.assign(fabWrapper.style, {
+      position: 'fixed',
+      bottom: '24px',
+      right: '24px',
+      width: '56px',
+      height: '56px',
+      zIndex: '99999',
+      transform: 'none',
+      filter: 'none',
+      contain: 'none',
+    });
+
     const fab = document.createElement('button');
     fab.id = 'ma-ai-fab';
     fab.innerHTML = '🤖';
     fab.title = 'AI Code Review (Ctrl+Shift+A)';
     Object.assign(fab.style, {
-      position: 'fixed', bottom: '24px', right: '24px', zIndex: '9999',
       width: '56px', height: '56px', borderRadius: '50%',
       background: '#1a73e8', color: '#fff', border: 'none',
       cursor: 'pointer', fontSize: '22px',
@@ -671,19 +942,33 @@ Gerrit.install(plugin => {
     });
     fab.addEventListener('mouseenter', () => fab.style.transform = 'scale(1.08)');
     fab.addEventListener('mouseleave', () => fab.style.transform = '');
-    fab.addEventListener('click', togglePanel);
-    document.body.appendChild(fab);
+    fab.addEventListener('click', () => {
+      MALog.ui('fab_clicked', { currentPanelOpen: panelEl?.style.display !== 'none' });
+      togglePanel();
+    });
+    fabWrapper.appendChild(fab);
+    document.documentElement.appendChild(fabWrapper);
     fabEl = fab;
 
     // Panel
     const panel = document.createElement('div');
     panel.id = 'ma-ai-panel';
     Object.assign(panel.style, {
-      position: 'fixed', bottom: '88px', right: '24px', zIndex: '9999',
-      width: '360px', background: '#fff', borderRadius: '12px',
+      position: 'fixed',
+      bottom: '88px',
+      right: '24px',
+      zIndex: '99999',
+      width: '360px',
+      background: '#fff',
+      borderRadius: '12px',
       boxShadow: '0 8px 32px rgba(0,0,0,.22)',
-      display: 'none', flexDirection: 'column', overflow: 'hidden',
+      display: 'none',
+      flexDirection: 'column',
+      overflow: 'hidden',
       fontFamily: "var(--font-family),'Roboto',Arial,sans-serif",
+      transform: 'none',
+      filter: 'none',
+      contain: 'none',
     });
 
     panel.innerHTML = `
@@ -714,20 +999,27 @@ Gerrit.install(plugin => {
       </div>
     `;
 
-    document.body.appendChild(panel);
+    document.documentElement.appendChild(panel);
     panelEl = panel;
-    logEl   = panel.querySelector('#ma-log');
+    logEl = panel.querySelector('#ma-log');
 
-    panel.querySelector('#ma-panel-close').addEventListener('click', closePanel);
+    panel.querySelector('#ma-panel-close').addEventListener('click', () => {
+      MALog.ui('ai_panel_closed', { via: 'close_button' });
+      closePanel();
+    });
     panel.querySelector('#ma-review-btn').addEventListener('click', runAiReview);
     panel.querySelector('#ma-clear-btn').addEventListener('click', () => {
+      MALog.ui('prompt_history_cleared', {});
       localStorage.removeItem(HISTORY_KEY);
       refreshHistoryDropdown();
     });
     panel.querySelector('#ma-prompt-input').addEventListener('focus', e => e.target.style.borderColor = '#1a73e8');
     panel.querySelector('#ma-prompt-input').addEventListener('blur',  e => e.target.style.borderColor = '#dadce0');
     panel.querySelector('#ma-history-select').addEventListener('change', e => {
-      if (e.target.value) panel.querySelector('#ma-prompt-input').value = e.target.value;
+      if (e.target.value) {
+        MALog.ui('prompt_history_selected', { prompt: e.target.value });
+        panel.querySelector('#ma-prompt-input').value = e.target.value;
+      }
     });
 
     refreshHistoryDropdown();
@@ -748,6 +1040,7 @@ Gerrit.install(plugin => {
     if (!panelEl) return;
     const open = panelEl.style.display !== 'none';
     panelEl.style.display = open ? 'none' : 'flex';
+    MALog.ui(open ? 'ai_panel_closed' : 'ai_panel_opened', { via: 'toggle' });
     if (!open) panelEl.querySelector('#ma-prompt-input').focus();
   }
   function closePanel() { if (panelEl) panelEl.style.display = 'none'; }
@@ -768,8 +1061,12 @@ Gerrit.install(plugin => {
   // ── Run AI review ─────────────────────────────────────────────────────────
   async function runAiReview() {
     const changeNum = getChangeNumber();
-    const patchSet  = getPatchSetNumber();
-    if (!changeNum) { logMsg('Cannot detect change number from URL', 'err'); return; }
+    const patchSet = await getEffectivePatchSetNumber(changeNum);
+    if (!changeNum) {
+      logMsg('Cannot detect change number from URL', 'err');
+      MALog.error('ai_review_no_change_number', { url: window.location.href });
+      return;
+    }
 
     const btn    = panelEl.querySelector('#ma-review-btn');
     const prompt = panelEl.querySelector('#ma-prompt-input').value.trim();
@@ -779,6 +1076,16 @@ Gerrit.install(plugin => {
     clearLog();
     logMsg('Sending diff to AI…');
 
+    const reviewStartTs = Date.now();
+    MALog.ai('review_requested', {
+      changeNum,
+      patchSet,
+      promptLength:  prompt.length,
+      promptPreview: prompt.slice(0, 120),
+      hasPrompt:     prompt.length > 0,
+      filePath:      getFilePath(),
+    });
+
     try {
       pushHistory(prompt);
       refreshHistoryDropdown();
@@ -787,6 +1094,15 @@ Gerrit.install(plugin => {
         `/changes/${changeNum}/revisions/${patchSet}/ai-review`,
         { prompt }
       );
+
+      const durationMs = Date.now() - reviewStartTs;
+      MALog.ai('review_complete', {
+        changeNum,
+        patchSet,
+        durationMs,
+        resultType: typeof result,
+        resultPreview: (typeof result === 'string' ? result : JSON.stringify(result)).slice(0, 120),
+      });
 
       logMsg(typeof result === 'string' ? result : 'AI review complete.', 'ok');
       logMsg('Loading comment data…', 'muted');
@@ -822,7 +1138,14 @@ Gerrit.install(plugin => {
       setTimeout(() => { btn.disabled = false; btn.textContent = 'Run AI Review'; }, 3000);
 
     } catch (err) {
+      const durationMs = Date.now() - reviewStartTs;
       logMsg('Error: ' + (err.message || String(err)), 'err');
+      MALog.error('ai_review_failed', {
+        changeNum,
+        patchSet,
+        durationMs,
+        error: err?.message || String(err),
+      });
       btn.disabled    = false;
       btn.textContent = 'Run AI Review';
     }
@@ -833,25 +1156,31 @@ Gerrit.install(plugin => {
   // ── FAB badge ─────────────────────────────────────────────────────────────
   function updateFabBadge() {
     if (!fabEl) return;
-    fabEl.querySelector('.ma-fab-badge')?.remove();
+    const wrapper = document.getElementById('ma-ai-fab-wrapper');
+    if (!wrapper) return;
+    wrapper.querySelector('.ma-fab-badge')?.remove();
     const n = savedComments.size;
     if (!n) return;
     const badge = document.createElement('span');
     badge.className = 'ma-fab-badge';
     Object.assign(badge.style, {
-      position:'absolute', top:'6px', right:'6px',
-      background:'#ea4335', color:'#fff',
-      borderRadius:'8px', fontSize:'10px', fontWeight:'700',
-      padding:'1px 5px', lineHeight:'1.4', pointerEvents:'none',
+      position: 'absolute', top: '6px', right: '6px',
+      background: '#ea4335', color: '#fff',
+      borderRadius: '8px', fontSize: '10px', fontWeight: '700',
+      padding: '1px 5px', lineHeight: '1.4', pointerEvents: 'none',
     });
     badge.textContent = n;
-    fabEl.style.position = 'relative';
-    fabEl.appendChild(badge);
+    // ← removed wrapper.style.position = 'relative'
+    wrapper.appendChild(badge);
   }
 
   // ── Keyboard shortcut ─────────────────────────────────────────────────────
   document.addEventListener('keydown', e => {
-    if (e.ctrlKey && e.shiftKey && e.key === 'A') { e.preventDefault(); togglePanel(); }
+    if (e.ctrlKey && e.shiftKey && e.key === 'A') {
+      e.preventDefault();
+      MALog.ui('keyboard_shortcut', { shortcut: 'Ctrl+Shift+A', action: 'toggle_ai_panel' });
+      togglePanel();
+    }
   });
 
   // ── Native-thread hider ────────────────────────────────────────────────────
@@ -875,9 +1204,10 @@ Gerrit.install(plugin => {
 
           const thread = el.thread;
           if (thread) {
-            const rootId   = thread.rootId || thread.comments?.[0]?.id;
+            const rawId   = thread.rootId || thread.comments?.[0]?.id || '';
             const firstMsg = thread.comments?.[0]?.message || '';
-            shouldHide = (rootId && savedComments.has(rootId)) || firstMsg.startsWith(AI_PREFIX);
+            // Match by raw Gerrit ID (no patchset prefix) or AI prefix
+            shouldHide = managedGerritIds.has(rawId) || firstMsg.startsWith(AI_PREFIX);
           }
           if (!shouldHide && (el.innerText || '').includes('🤖 AI Review:')) shouldHide = true;
           if (!shouldHide && el.shadowRoot?.innerHTML.includes('🤖 AI Review:')) shouldHide = true;
@@ -903,7 +1233,7 @@ Gerrit.install(plugin => {
     let pollCount = 0;
     hidePoller = setInterval(() => {
       hideAll();
-      if (++pollCount >= 40) clearInterval(hidePoller);
+      if (++pollCount >= 80) clearInterval(hidePoller);
     }, 100);
   }
 
@@ -1115,20 +1445,40 @@ Gerrit.install(plugin => {
 
       tr.querySelector('.ma-resolve-checkbox').addEventListener('change', async ev => {
         ev.stopPropagation();
-        comment.resolved = ev.target.checked;
+        const newResolved = ev.target.checked;
+        MALog.comment('resolve_toggled', {
+          commentId,
+          resolved: newResolved,
+          isAi,
+          path: filePath,
+        });
+        comment.resolved = newResolved;
         card.classList.toggle('resolved', comment.resolved);
         try {
-          await updateDraft(
-            getChangeNumber(), getPatchSetNumber(), commentId,
+          const changeNum = getChangeNumber();
+          const patchSet = await getEffectivePatchSetNumber(changeNum);
+          await updateDraft(changeNum, patchSet, toGerritDraftId(commentId),
             isAi ? AI_PREFIX + '\n\n' + displayText : displayText,
             !comment.resolved
           );
-        } catch { /* non-critical */ }
+          MALog.comment('resolve_saved', { commentId, resolved: newResolved });
+        } catch (err) {
+          MALog.error('resolve_save_failed', {
+            commentId,
+            error: err?.message || String(err),
+          });
+        }
         displaySavedComments(table, filePath);
       });
 
       tr.querySelector('.ma-edit-btn').addEventListener('click', ev => {
         ev.stopPropagation();
+        MALog.comment('edit_opened', {
+          commentId,
+          isAi,
+          path: filePath,
+          currentLength: displayText.length,
+        });
         body.style.display     = 'none';
         editArea.style.display = 'block';
         textarea.focus();
@@ -1137,6 +1487,7 @@ Gerrit.install(plugin => {
 
       tr.querySelector('.ma-edit-cancel').addEventListener('click', ev => {
         ev.stopPropagation();
+        MALog.comment('edit_cancelled', { commentId, isAi });
         body.style.display     = '';
         editArea.style.display = 'none';
       });
@@ -1147,18 +1498,46 @@ Gerrit.install(plugin => {
         if (!newText) return;
         const btn = tr.querySelector('.ma-edit-save');
         btn.disabled = true; btn.textContent = 'Saving…';
+
+        MALog.comment('edit_save_start', {
+          commentId,
+          isAi,
+          path: filePath,
+          oldLength: displayText.length,
+          newLength: newText.length,
+          changed: newText !== displayText,
+        });
+
         try {
           const storageText = isAi ? AI_PREFIX + '\n\n' + newText : newText;
-          await updateDraft(getChangeNumber(), getPatchSetNumber(), commentId, storageText, !comment.resolved);
+          const changeNum = getChangeNumber();
+          const patchSet = await getEffectivePatchSetNumber(changeNum);
+          await updateDraft(changeNum, patchSet, toGerritDraftId(commentId), storageText, !comment.resolved);
           comment.text = storageText;
+          MALog.comment('edit_save_success', {
+            commentId,
+            isAi,
+            newLength: newText.length,
+            messagePreview: newText.slice(0, 80),
+          });
           displaySavedComments(table, filePath);
-        } catch {
+        } catch (err) {
+          MALog.error('edit_save_failed', {
+            commentId,
+            error: err?.message || String(err),
+          });
           btn.disabled = false; btn.textContent = 'Save draft';
         }
       });
 
       tr.querySelector('.ma-discard-btn').addEventListener('click', async ev => {
         ev.stopPropagation();
+        MALog.comment('discard_clicked', {
+          commentId,
+          isAi,
+          path: filePath,
+          anchorCount: lines.length,
+        });
         const btn = tr.querySelector('.ma-discard-btn');
         btn.disabled = true; btn.textContent = 'Deleting…';
         const ok = await deleteMultiAnchorComment(commentId);
@@ -1174,6 +1553,12 @@ Gerrit.install(plugin => {
       // AC3: Click to persistently toggle highlight
       tr.addEventListener('click', () => {
         const on = tr.classList.toggle('ma-active');
+        MALog.ui('comment_highlight_toggled', {
+          commentId,
+          on,
+          isAi,
+          path: filePath,
+        });
         highlightLines(table, filePath, lines, on);
       });
 
@@ -1229,16 +1614,28 @@ Gerrit.install(plugin => {
   }
 
   function toggleLine(lineKey, side, row) {
-    if (selectedLines.has(lineKey)) {
+    const wasSelected = selectedLines.has(lineKey);
+    if (wasSelected) {
       selectedLines.delete(lineKey);
       setSelectedVisual(row, side, false);
     } else {
       selectedLines.add(lineKey);
       setSelectedVisual(row, side, true);
     }
+
+    const anchor = parseAnchorKey(lineKey);
+    const stats  = getPendingAnchorStats();
+    MALog.anchor(wasSelected ? 'line_deselected' : 'line_selected', {
+      path:        anchor?.path,
+      side:        anchor?.side,
+      lineNum:     anchor?.lineNum,
+      totalSelected:  stats.anchorCount,
+      filesInvolved:  stats.fileCount,
+    });
   }
 
   function clearSelectionDeep() {
+    const prevCount = selectedLines.size;
     selectedLines.clear();
     walkShadowTree(document.body, node => {
       if (node.nodeType !== 1 || !node.querySelectorAll) return;
@@ -1248,6 +1645,9 @@ Gerrit.install(plugin => {
         td.querySelectorAll('button.lineNumButton').forEach(el => { el.style.backgroundColor = ''; });
       });
     });
+    if (prevCount > 0) {
+      MALog.anchor('selection_cleared', { clearedCount: prevCount });
+    }
   }
 
   // ── Comment-draft box ─────────────────────────────────────────────────────
@@ -1281,11 +1681,23 @@ Gerrit.install(plugin => {
     const positionKey = getLastAnchorKeyForFile(keys, filePath);
     if (!positionKey) {
       console.warn('[multianchor-comment] Open a file where you selected lines to compose the draft.');
+      MALog.ui('comment_box_no_anchor', { filePath });
       return;
     }
 
-    const lineLabels = formatGroupedAnchorLabels(keys);
     const stats = getPendingAnchorStats();
+    MALog.ui('comment_box_opened', {
+      filePath,
+      anchorCount: stats.anchorCount,
+      fileCount:   stats.fileCount,
+      isMultiFile: stats.fileCount > 1,
+      anchors: keys.map(k => {
+        const a = parseAnchorKey(k);
+        return a ? { path: a.path, side: a.side, line: a.lineNum } : k;
+      }),
+    });
+
+    const lineLabels = formatGroupedAnchorLabels(keys);
     const pendingHint = stats.fileCount > 1
       ? ` · ${stats.anchorCount} anchors across ${stats.fileCount} files`
       : '';
@@ -1337,6 +1749,10 @@ Gerrit.install(plugin => {
     textarea.addEventListener('blur',  () => textarea.style.borderColor = 'var(--border-color,#dadce0)');
 
     tr.querySelector('.ma-new-cancel').addEventListener('click', () => {
+      MALog.ui('comment_box_cancelled', {
+        filePath,
+        anchorCount: keys.length,
+      });
       tr.remove(); clearSelectionDeep();
     });
 
@@ -1346,13 +1762,36 @@ Gerrit.install(plugin => {
       if (!text) return;
       const saveBtn = tr.querySelector('.ma-new-save');
       saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
-      const draft = await createMultiAnchorComment(selectedLines, text, resolved);
-      if (draft) {
-        tr.remove(); clearSelectionDeep();
-        displaySavedComments(table, filePath);
-      } else {
-        saveBtn.disabled = false; saveBtn.textContent = 'Save draft';
-      }
+
+      MALog.comment('new_draft_save_start', {
+        filePath,
+        anchorCount:   keys.length,
+        fileCount:     stats.fileCount,
+        isMultiFile:   stats.fileCount > 1,
+        resolved,
+        messageLength: text.length,
+        messagePreview: text.slice(0, 80),
+      });
+
+      const { draft, error } = await createMultiAnchorComment(selectedLines, text, resolved);
+        if (draft) {
+          tr.remove(); clearSelectionDeep();
+          displaySavedComments(table, filePath);
+          MALog.comment('new_draft_saved', {
+            commentId:  draft.id,
+            filePath,
+            anchorCount: keys.length,
+            resolved,
+          });
+        } else {
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save draft';
+          const msg = error?.message || String(error) || 'Unknown error';
+          saveBtn.insertAdjacentHTML('afterend',
+            `<span style="color:#c62828;font-size:11px;margin-left:6px;" class="ma-save-err">⚠ ${escHtml(msg)}</span>`
+          );
+          MALog.error('new_draft_save_failed', { filePath, error: msg });
+        }
     });
   }
 
@@ -1434,11 +1873,21 @@ Gerrit.install(plugin => {
       if (table && filePath) {
         e.stopImmediatePropagation();
         e.preventDefault();
+        MALog.ui('keyboard_shortcut', {
+          shortcut: 'c',
+          action: 'open_comment_box',
+          anchorCount: selectedLines.size,
+          filePath,
+        });
         showCommentBox(table, filePath);
       }
     }
 
     if (e.key === 'Escape' && hasDraftRowDeep()) {
+      MALog.ui('keyboard_shortcut', {
+        shortcut: 'Escape',
+        action: 'dismiss_comment_box',
+      });
       removeDraftRowsDeep();
       clearSelectionDeep();
     }
@@ -1448,8 +1897,9 @@ Gerrit.install(plugin => {
   let diffObserver         = null;
   let observedDiffRoot     = null;
   let attachPollInstalled  = false;
+  let lastLoadTs = 0;
 
-  function attachListeners() {
+  async function attachListeners() {
     const diffElement = getDiffElement();
     if (!diffElement) { setTimeout(attachListeners, 500); return; }
 
@@ -1459,32 +1909,47 @@ Gerrit.install(plugin => {
     const { table, filePath } = getTablePathPair(diffElement);
     if (!table || !filePath) { setTimeout(attachListeners, 500); return; }
 
-    setupNativeThreadHider();
-
     if (!documentHooksInstalled) {
       documentHooksInstalled = true;
       document.addEventListener('click', onDocumentClickCapture, true);
       document.addEventListener('keydown', onDocumentKeydownCapture, true);
-    }
-
-    // Lightweight poll: rehydrates selection and re-renders when Gerrit
-    // swaps the diff element during file navigation.
-    if (!attachPollInstalled) {
-      attachPollInstalled = true;
-      // Reset the effective patchset cache on each new attach cycle so that
-      // navigation to a different change or patchset picks up fresh data.
-      effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
-      setInterval(attachListeners, 700);
+      MALog.session('document_hooks_installed', { filePath });
     }
 
     const changeNum = getChangeNumber();
-    const patchSet  = getPatchSetNumber();
-    if (changeNum) {
-      loadMultiAnchorComments(changeNum, patchSet).then(() => {
-        displaySavedComments(table, filePath);
-        setupNativeThreadHider();
-      });
+    const patchSet  = await getEffectivePatchSetNumber(changeNum);
+
+    if (!attachPollInstalled) {
+      attachPollInstalled = true;
+      effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
+      if (changeNum) {
+        // ── Phase 1: pre-populate managedGerritIds ASAP so the hider works
+        //    before the full load completes. getAllAdditionalRanges is cheap
+        //    (one Git read) and returns the keys we need to suppress threads.
+        getAllAdditionalRanges(changeNum).then(additionalRanges => {
+          if (!additionalRanges) return;
+          Object.keys(additionalRanges).forEach(storageKey => {
+            // storageKey is "{patchSet}/{rawGerritId}" — extract the raw ID
+            const rawId = storageKey.includes('/')
+              ? storageKey.split('/').slice(1).join('/')
+              : storageKey;
+            managedGerritIds.add(rawId);
+          });
+          setupNativeThreadHider(); // restart hider with pre-populated IDs
+        }).catch(() => {});
+
+        // ── Phase 2: full load (drafts + ranges), then render plugin UI
+        loadMultiAnchorComments(changeNum, patchSet).then(() => {
+          setupNativeThreadHider();
+          displaySavedComments(table, filePath);
+        });
+      }
+      setInterval(attachListeners, 700);
     }
+
+    setupNativeThreadHider();
+
+    if (!commentsLoaded) return;
 
     displaySavedComments(table, filePath);
     const applied = applyPendingSelectionToTable(table, filePath);

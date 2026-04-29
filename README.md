@@ -9,6 +9,8 @@ Place the multianchor_comment folder inside /plugins
 
 Build the Gerrit WAR: `bazel build //:gerrit`
 
+Note: You may need to run `REPIN=1 bazel run @external_deps//:pin` if upstream dependencies changed
+
 # Initialize a development Gerrit site
 
 Run: `java -jar bazel-bin/gerrit.war init --batch --dev -d /tmp/gerrit-site`

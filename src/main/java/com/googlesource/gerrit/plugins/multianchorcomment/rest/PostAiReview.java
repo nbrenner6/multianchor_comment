@@ -66,6 +66,7 @@ public class PostAiReview implements RestModifyView<RevisionResource, PostAiRevi
           storage.saveRanges(
               rsrc.getProject(),
               rsrc.getChange().getId(),
+              revisionId,
               posted.id,
               aiComment.allRanges.subList(1, aiComment.allRanges.size())
           );
