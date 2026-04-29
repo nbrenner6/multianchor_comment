@@ -96,7 +96,7 @@ public class AiReviewClient {
         model,
         SYSTEM_PROMPT,
         List.of(new Message("user", userContent)),
-        1000
+        4096
     ));
 
     HttpRequest request = HttpRequest.newBuilder()
@@ -136,19 +136,75 @@ public class AiReviewClient {
   private String extractContent(String responseBody) {
     var parsed  = gson.fromJson(responseBody, java.util.Map.class);
 
+    // Surface stop_reason so truncation is visible in logs
+    String stopReason = (String) parsed.get("stop_reason");
+    if ("max_tokens".equals(stopReason)) {
+      System.err.println("[multianchor] WARNING: AI response was truncated (max_tokens reached). " +
+          "Increase max_tokens or ask for fewer comments.");
+    }
+
     var content = (List<?>) parsed.get("content");
     if (content == null) {
       throw new RuntimeException("AI API error: " + responseBody);
     }
-    var first = (java.util.Map<?,?>) content.get(0);
+    var first  = (java.util.Map<?,?>) content.get(0);
     String text = (String) first.get("text");
 
-    // Strip markdown code fences if present
+    // Strip markdown fences
     text = text.strip();
     if (text.startsWith("```")) {
       text = text.replaceAll("^```[a-z]*\\n?", "").replaceAll("```$", "").strip();
     }
 
+    // If the response was truncated, the JSON array will be incomplete.
+    // Recover by trimming to the last complete object so we can parse what we got.
+    if ("max_tokens".equals(stopReason)) {
+      text = recoverTruncatedJsonArray(text);
+    }
+
     return text;
+  }
+
+  /**
+   * Given a truncated JSON array string like:
+   *   [{"a":1}, {"b":2}, {"c":"incomplet
+   * Returns the longest valid prefix as a closed array:
+   *   [{"a":1}, {"b":2}]
+   */
+  private String recoverTruncatedJsonArray(String text) {
+    // Walk backwards from the end to find the last '}' that closes a complete object.
+    // Then close the array after it.
+    int depth = 0;
+    int lastCompleteObjectEnd = -1;
+    boolean inString = false;
+    char[] chars = text.toCharArray();
+
+    for (int i = 0; i < chars.length; i++) {
+      char c = chars[i];
+      if (c == '\\' && inString) { i++; continue; } // skip escaped char
+      if (c == '"')  { inString = !inString; continue; }
+      if (inString)  { continue; }
+      if (c == '{')  { depth++; }
+      if (c == '}')  {
+        depth--;
+        if (depth == 0) lastCompleteObjectEnd = i; // top-level object closed
+      }
+    }
+
+    if (lastCompleteObjectEnd == -1) {
+      System.err.println("[multianchor] Could not recover any complete objects from truncated response.");
+      return "[]";
+    }
+
+    // Slice to include everything up to and including the last complete object,
+    // then close the array.
+    String recovered = text.substring(0, lastCompleteObjectEnd + 1).stripTrailing();
+    // Remove any trailing comma left after the last complete object
+    if (recovered.endsWith(",")) {
+      recovered = recovered.substring(0, recovered.length() - 1);
+    }
+    recovered = recovered + "]";
+    System.err.println("[multianchor] Recovered " + recovered.chars().filter(c -> c == '{').count() + " complete comments from truncated response.");
+    return recovered;
   }
 }

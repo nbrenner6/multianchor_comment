@@ -1,793 +1,46 @@
 /**
  * Multi-Anchor Comment Plugin for Gerrit
  *
- * Extends Gerrit's code review UI to support comments anchored to multiple
- * non-adjacent lines within a single diff view. Standard Gerrit only allows
- * comments on a single line or a contiguous range; this plugin lets reviewers
- * reference scattered but related lines (e.g., a renamed variable and all its
- * call sites) in one comment thread.
+ * Extends Gerrit's code-review UI to support comments anchored to multiple
+ * non-adjacent line ranges in a single diff.  Standard Gerrit only allows a
+ * comment on one contiguous range; this plugin lets reviewers reference
+ * scattered-but-related lines (e.g. a renamed variable and all its call sites)
+ * in one comment thread.
  *
- * @see README.md for build and usage instructions.
  */
 Gerrit.install(plugin => {
 
-  // Get the plugin's REST API helper
+  // ── REST helper ────────────────────────────────────────────────────────────
   const restApi = plugin.restApi();
 
-  // In-memory cache for multi-anchor comments (synced with backend)
+  // ── In-memory store ────────────────────────────────────────────────────────
   const savedComments = new Map();
 
-  /**
-   * Gets the current change number from the URL.
-   * URL format: /c/PROJECT/+/CHANGE_NUMBER/[PATCHSET]/[FILE]
-   */
+  // ── URL helpers ────────────────────────────────────────────────────────────
   function getChangeNumber() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/(\d+)/);
-    return match ? match[1] : null;
+    const m = window.location.pathname.match(/\/c\/[^/]+\/\+\/(\d+)/);
+    return m ? m[1] : null;
   }
-
-  /**
-   * Gets the current patchset number from the URL.
-   */
   function getPatchSetNumber() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/(\d+)/);
-    return match ? match[1] : 'current';
+    const m = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/(\d+)/);
+    return m ? m[1] : 'current';
   }
-
-  /**
-   * Gets the current file path from the URL.
-   */
   function getFilePath() {
-    const match = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/\d+\/(.+)/);
-    return match ? decodeURIComponent(match[1]) : null;
+    const m = window.location.pathname.match(/\/c\/[^/]+\/\+\/\d+\/\d+\/(.+)/);
+    return m ? decodeURIComponent(m[1]) : null;
   }
 
-  /**
-   * Converts selected line keys to Comment.Range format.
-   * @param {Set<string>} lineKeys - Set of "side-lineNum" strings
-   * @param {string} side - "left" or "right" to filter by
-   * @returns {Array<Range>} Array of range objects
-   */
-  function lineKeysToRanges(lineKeys, side) {
-    const lineNums = [...lineKeys]
-      .filter(key => key.startsWith(side))
-      .map(key => parseInt(key.split('-')[1], 10))
-      .sort((a, b) => a - b);
-
-    if (lineNums.length === 0) return [];
-
-    // Group consecutive lines into ranges
-    const ranges = [];
-    let rangeStart = lineNums[0];
-    let rangeEnd = lineNums[0];
-
-    for (let i = 1; i < lineNums.length; i++) {
-      if (lineNums[i] === rangeEnd + 1) {
-        rangeEnd = lineNums[i];
-      } else {
-        ranges.push({
-          start_line: rangeStart,
-          start_character: 0,
-          end_line: rangeEnd,
-          end_character: 0
-        });
-        rangeStart = lineNums[i];
-        rangeEnd = lineNums[i];
-      }
-    }
-    ranges.push({
-      start_line: rangeStart,
-      start_character: 0,
-      end_line: rangeEnd,
-      end_character: 0
-    });
-
-    return ranges;
+  // ── Prompt history (localStorage) ─────────────────────────────────────────
+  const HISTORY_KEY = 'ma-plugin:prompt-history';
+  const MAX_HISTORY = 5;
+  function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; } }
+  function pushHistory(prompt) {
+    if (!prompt.trim()) return;
+    const h = [prompt, ...loadHistory().filter(p => p !== prompt)].slice(0, MAX_HISTORY);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
   }
 
-  /**
-   * Creates a draft comment via Gerrit's native API.
-   * Note: Gerrit uses PUT (not POST) to create draft comments.
-   * For whole-line selections, we only send 'line' (no range).
-   * @returns {Promise<Object>} The created comment info
-   */
-  async function createDraft(changeNum, patchSet, path, range, message, unresolved) {
-    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
-
-    // For whole-line selections (startChar=0, endChar=0), don't send a range
-    // Just use the line number like native Gerrit comments
-    const body = {
-      path: path,
-      line: range.end_line,
-      message: message,
-      unresolved: unresolved
-    };
-
-    return restApi.put(endpoint, body);
-  }
-
-  /**
-   * Deletes a draft comment via Gerrit's native API.
-   */
-  async function deleteDraft(changeNum, patchSet, draftId) {
-    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`;
-    return restApi.delete(endpoint);
-  }
-
-  /**
-   * Saves additional ranges for a comment via plugin API.
-   */
-  async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
-    const body = { ranges: ranges };
-    return await restApi.put(endpoint, body);
-  }
-
-  /**
-   * Gets additional ranges for a comment via plugin API.
-   */
-  async function getAdditionalRanges(changeNum, commentUuid) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
-    return restApi.get(endpoint);
-  }
-
-  /**
-   * Deletes additional ranges for a comment via plugin API.
-   */
-  async function deleteAdditionalRanges(changeNum, commentUuid) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges/${commentUuid}`;
-    return restApi.delete(endpoint);
-  }
-
-  /**
-   * Gets all additional ranges for a change via plugin API.
-   */
-  async function getAllAdditionalRanges(changeNum) {
-    const endpoint = `/changes/${changeNum}/multianchor-ranges`;
-    return restApi.get(endpoint);
-  }
-
-  /**
-   * Loads all drafts and their additional ranges.
-   */
-  async function loadMultiAnchorComments(changeNum, patchSet) {
-    try {
-      // Get all drafts from Gerrit
-      const draftsEndpoint = `/changes/${changeNum}/revisions/${patchSet}/drafts`;
-      const drafts = await restApi.get(draftsEndpoint);
-
-      // Get all additional ranges from plugin
-      const additionalRanges = await getAllAdditionalRanges(changeNum);
-
-      // Clear and rebuild cache
-      savedComments.clear();
-
-      // Process drafts - drafts is a map of path -> array of comments
-      for (const [path, comments] of Object.entries(drafts || {})) {
-        for (const comment of comments) {
-          const uuid = comment.id;
-          const extraRanges = additionalRanges[uuid] || [];
-
-          // Only include comments that have additional ranges (multi-anchor)
-          if (extraRanges.length > 0) {
-            // Combine primary range with additional ranges.
-            // comment.range is only set when we sent a range object; when we sent only `line`,
-            // Gerrit stores no range so we reconstruct it from comment.line.
-            const primaryRange = comment.range ||
-              (comment.line ? {start_line: comment.line, start_character: 0, end_line: comment.line, end_character: 0} : null);
-            const allRanges = primaryRange ? [primaryRange, ...extraRanges] : extraRanges;
-
-            // Convert ranges to line keys for UI
-            const lines = allRanges.flatMap(range => {
-              const lineKeys = [];
-              for (let line = range.start_line; line <= range.end_line; line++) {
-                lineKeys.push(`right-${line}`);  // Assuming right side for now
-              }
-              return lineKeys;
-            });
-
-            savedComments.set(uuid, {
-              id: uuid,
-              path: path,
-              lines: lines,
-              text: comment.message,
-              resolved: comment.unresolved === false,
-              primaryRange: comment.range,
-              additionalRanges: extraRanges
-            });
-          }
-        }
-      }
-
-      return savedComments;
-    } catch (error) {
-      return savedComments;
-    }
-  }
-
-  /**
-   * Creates a multi-anchor comment (draft + additional ranges).
-   */
-  async function createMultiAnchorComment(selectedLines, message, resolved) {
-    const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
-    const path = getFilePath();
-
-    if (!changeNum || !path) {
-      return null;
-    }
-
-    // Determine which side has the most selections
-    const rightLines = [...selectedLines].filter(k => k.startsWith('right'));
-    const leftLines = [...selectedLines].filter(k => k.startsWith('left'));
-    const side = rightLines.length >= leftLines.length ? 'right' : 'left';
-
-    // Convert line selections to ranges
-    const allRanges = lineKeysToRanges(selectedLines, side);
-
-    if (allRanges.length === 0) {
-      return null;
-    }
-
-    try {
-      // 1. Create draft with primary (first) range via Gerrit API
-      const primaryRange = allRanges[0];
-      const draft = await createDraft(changeNum, patchSet, path, primaryRange, message, !resolved);
-
-      // 2. If there are additional ranges, save them via plugin API
-      if (allRanges.length > 1) {
-        const additionalRanges = allRanges.slice(1);
-        await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
-      }
-
-      // 3. Add to local cache
-      savedComments.set(draft.id, {
-        id: draft.id,
-        path: path,
-        lines: [...selectedLines],
-        text: message,
-        resolved: resolved,
-        primaryRange: primaryRange,
-        additionalRanges: allRanges.slice(1)
-      });
-
-      return draft;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  /**
-   * Deletes a multi-anchor comment (draft + additional ranges).
-   */
-  async function deleteMultiAnchorComment(commentId) {
-    const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
-
-    if (!changeNum) {
-      return false;
-    }
-
-    try {
-      // 1. Delete draft from Gerrit first
-      await deleteDraft(changeNum, patchSet, commentId);
-
-      // 2. Delete additional ranges from plugin storage
-      await deleteAdditionalRanges(changeNum, commentId);
-
-      // 3. Remove from local cache
-      savedComments.delete(commentId);
-
-      return true;
-    } catch (error) {
-      return false;
-    }
-  }
-
-  /**
-   * Injects CSS styles into the Gerrit diff element that are specific to the
-   * multi-anchor comment plug-in
-   *
-   * This function appends a <style> tag to the diffElement that is provided
-   * in the function call, highlighting (yellow), anchored-line indicators
-   * (blue border), and hover highlights.
-   *
-   * Styles rely on Gerrit's slass names and table structure.
-   *
-   * @param {HTMLElement} diffElement
-   * @returns {void}
-   */
-  function injectStyles(diffElement) {
-    const style = document.createElement('style');
-    style.textContent = `
-      td.multi-anchor-selected div.contentText {
-        background-color: rgba(255, 200, 0, 0.3) !important;
-      }
-      td.multi-anchor-selected button.lineNumButton {
-        background-color: rgba(255, 200, 0, 0.3) !important;
-      }
-
-      /* AC1: Visual indicators for anchored lines */
-      td.multi-anchor-existing div.contentText {
-        border-left: 3px solid rgb(25, 103, 210) !important;
-        background-color: rgba(66, 133, 244, 0.12) !important;
-      }
-      td.multi-anchor-existing button.lineNumButton {
-        background-color: rgba(66, 133, 244, 0.15) !important;
-      }
-
-      /* AC2: Highlighted state for hover/click */
-      td.multi-anchor-highlighted div.contentText {
-        background-color: rgba(66, 133, 244, 0.35) !important;
-        border-left: 3px solid rgb(25, 103, 210) !important;
-      }
-      td.multi-anchor-highlighted button.lineNumButton {
-        background-color: rgba(66, 133, 244, 0.35) !important;
-      }
-
-      /* Comment thread styling */
-      .multi-anchor-thread {
-        cursor: pointer;
-      }
-
-    `;
-
-    diffElement.appendChild(style);
-  }
-
-  // Inject AI Review button into the diff toolbar
-  function injectAiReviewButton(diffElement) {
-    if (diffElement.querySelector('#ma-ai-review-btn')) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'ma-ai-review-btn';
-    btn.textContent = '🤖 AI Review';
-    btn.style.cssText = `
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 9999;
-      background: rgb(25, 103, 210);
-      color: white;
-      border: none;
-      border-radius: 24px;
-      padding: 10px 20px;
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-      font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-    `;
-
-    btn.addEventListener('click', async () => {
-      const changeNum = getChangeNumber();
-      const patchSet  = getPatchSetNumber();
-      if (!changeNum) return;
-
-      btn.disabled    = true;
-      btn.textContent = '🤖 Reviewing...';
-
-      try {
-        const endpoint = `/changes/${changeNum}/revisions/${patchSet}/ai-review`;
-        await restApi.post(endpoint, { prompt: '' });
-
-        // Reload multi-anchor comments so AI drafts appear
-        await loadMultiAnchorComments(changeNum, patchSet);
-        const table = diffElement.querySelector('table#diffTable');
-        if (table) displaySavedComments(table);
-
-        btn.textContent = '✓ Done';
-        setTimeout(() => {
-          btn.disabled    = false;
-          btn.textContent = '🤖 AI Review';
-        }, 3000);
-      } catch (err) {
-        btn.disabled    = false;
-        btn.textContent = '🤖 AI Review';
-      }
-    });
-
-    document.body.appendChild(btn);
-  }
-
-  /** Set of currently selected line keys (format: "left-42" or "right-17"). Cleared on comment save/cancel. */
-  const selectedLines = new Set();
-
-  /**
-   * Toggles the selected state for a specific diff line in a multi-anchor
-   * comment
-   *
-   * If the lineKey has already been selected, it updates the global variable,
-   * selectedLinesSet, removing it. It also updates the corresponding table cells,
-   * removing the selected class. If the lineKey has NOT already been selected,
-   * this function adds its corresponding lineKey and gives it the selected styling.
-   *
-   * @param {string} lineKey - unique ID for a line, uses the format "side-lineNum"
-   * @param {"left" | "right"} side - denotes the side of the diff the line is on
-   * @param {HTMLTableRowElement} row - the row element representing the line in the diff
-   * @returns {void}
-   */
-  function toggleLine(lineKey, side, row) {
-    if (selectedLines.has(lineKey)) {
-      selectedLines.delete(lineKey);
-      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.remove('multi-anchor-selected'));
-    }
-    else {
-      selectedLines.add(lineKey);
-      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.add('multi-anchor-selected'));
-    }
-  }
-
-  /**
-   * Creates, inserts, and does the rendering for a multi-anchor comment draft box
-   * in the diff table.
-   *
-   * US2: Renders a draft comment box anchored below the last selected line.
-   * Displays all anchored line numbers for confirmation and provides Save/Cancel actions.
-   *
-   * @param {HTMLTableElement} table - the Gerrit diff table
-   * @param {Set<String>} selectedLines - set of line keys that are currently
-   * selected
-   * @returns {void}
-   */
-  function showCommentBox(table, selectedLines) {
-    const existing = table.querySelector('tr.multi-anchor-comment-row');
-    if (existing) {
-      existing.remove();
-    }
-
-    const lineLabels = [...selectedLines].join(', ');
-
-    const tr = document.createElement('tr');
-    tr.classList.add('multi-anchor-comment-row');
-    tr.innerHTML = `
-      <td colspan="2"></td>
-      <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color); overflow: hidden;">
-        <div style="
-          background-color: rgb(254, 247, 224);
-          padding: var(--spacing-m);
-          font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-          font-size: var(--font-size-normal, 1rem);
-          display: flex;
-          align-items: center;
-          overflow: hidden;
-        ">
-          <span style="color: var(--info-foreground);">✏</span>&nbsp;
-          <span style="font-weight: var(--font-weight-medium);">Draft</span>
-          <span style="color: var(--deemphasized-text-color); margin-left: var(--spacing-s); font-weight: normal;">
-            · Multi-anchor: ${lineLabels}
-          </span>
-        </div>
-        <div style="
-          background-color: rgb(254, 247, 224);
-          padding: var(--spacing-m);
-          font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-          font-size: var(--font-size-normal, 1rem);
-          color: var(--primary-text-color);
-          overflow: hidden;
-        ">
-          <textarea class="multi-anchor-textarea" rows="4" placeholder="Mention others with @" style="
-            display: block; margin-bottom: var(--spacing-m); width: 100%;
-            box-sizing: border-box; font: inherit;
-            background-color: white;
-            border: 1px solid var(--border-color);
-            border-radius: var(--border-radius);
-            color: rgb(32, 33, 35);
-            padding: var(--spacing-s);
-          "></textarea>
-          <div style="display: flex; justify-content: space-between; user-select: none;">
-            <div style="display: flex; align-items: center; flex: 1;">
-              <label style="display: flex; align-items: center; color: var(--comment-text-color);">
-                <input type="checkbox" class="multi-anchor-resolved" style="margin-right: var(--spacing-s);"> Resolved
-              </label>
-            </div>
-            <div style="display: flex;">
-              <button class="multi-anchor-cancel" style="
-                background: none; border: none; color: var(--link-color);
-                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-                font-weight: var(--font-weight-medium);
-              ">Cancel</button>
-              <button class="multi-anchor-save" style="
-                background: none; border: none; color: var(--link-color);
-                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-                font-weight: var(--font-weight-medium);
-              ">Save</button>
-            </div>
-          </div>
-        </div>
-      </td>
-    `;
-
-    // insert after last
-    const lastLineKey = [...selectedLines][selectedLines.size - 1];
-    const [side, lineNum] = lastLineKey.split('-');
-    const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-    if (lastRow) {
-      lastRow.insertAdjacentElement('afterend', tr);
-    }
-    else {
-      table.appendChild(tr);
-    }
-
-    tr.querySelector('.multi-anchor-save').addEventListener('click', async () => {
-      const text = tr.querySelector('.multi-anchor-textarea').value;
-      const resolved = tr.querySelector('.multi-anchor-resolved').checked;
-
-      if (!text.trim()) {
-        return;
-      }
-
-      // Disable buttons while saving
-      tr.querySelector('.multi-anchor-save').disabled = true;
-      tr.querySelector('.multi-anchor-save').textContent = 'Saving...';
-
-      try {
-        // Save to backend via REST API
-        const draft = await createMultiAnchorComment(selectedLines, text, resolved);
-
-        if (draft) {
-          tr.remove();
-          clearSelection(table);
-
-          // Display the saved comment with AC1, AC2, AC3 handlers
-          displaySavedComments(table);
-        } else {
-          tr.querySelector('.multi-anchor-save').disabled = false;
-          tr.querySelector('.multi-anchor-save').textContent = 'Save';
-        }
-      } catch (error) {
-        tr.querySelector('.multi-anchor-save').disabled = false;
-        tr.querySelector('.multi-anchor-save').textContent = 'Save';
-      }
-    });
-
-    tr.querySelector('.multi-anchor-cancel').addEventListener('click', () => {
-      tr.remove();
-      clearSelection(table);
-    });
-
-    tr.querySelector('.multi-anchor-textarea').focus();
-  }
-
-  /**
-   * Clears all selected lines and removes their visual highlights.
-   *
-   * This function empties the selectedLines Set, and removes inline styling
-   * that was applied to the selected cells.
-   *
-   * @param {HTMLTableElement} table - Gerrit diff table that contains the
-   * selected rows
-   */
-
-  function clearSelection(table) {
-    selectedLines.clear();
-    table.querySelectorAll('td.multi-anchor-selected div.contentText').forEach(el => {
-      el.style.backgroundColor = '';
-    });
-    table.querySelectorAll('td.multi-anchor-selected button.lineNumButton').forEach(el => {
-      el.style.backgroundColor = '';
-    });
-    table.querySelectorAll('td.multi-anchor-selected').forEach(td => {
-      td.classList.remove('multi-anchor-selected');
-    });
-  }
-
-  /**
-   * Marks lines associated w/ a multi-anchor comment. Adds the class
-   * 'multi-anchor-existing' to all of the table cells on the selected lines,
-   * visually indicating they are anchored in a comment thread.
-   *
-   * AC1
-   *
-   * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys
-   */
-  function markAnchoredLines(table, lines) {
-    lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-      if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
-          td.classList.add('multi-anchor-existing');
-        });
-      }
-    });
-  }
-
-
-  /**
-   * Temporarily highlihgts the lines associated with a multi-anchor comment
-   *
-   * Specifically, used for the hover/click interactions (AC2), visually
-   * linking comment thread with its lines
-   *
-   * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {*} lines - array of line keys
-   */
-  function highlightCommentLines(table, lines) {
-    lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-      if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
-          td.classList.add('multi-anchor-highlighted');
-        });
-      }
-    });
-  }
-
-
-  /**
-   * Reverses the effects of highlightCommentLines, removing the 'multi-anchor-highlighted'
-   * class from the specified lines
-   *
-   * @param {HTMLTableElement} table - Gerrit diff table
-   * @param {string[]} lines - array of line keys that will be unhighlighted
-   */
-  function unhighlightCommentLines(table, lines) {
-    lines.forEach(lineKey => {
-      const [side, lineNum] = lineKey.split('-');
-      const row = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-      if (row) {
-        row.querySelectorAll(`td.${side}`).forEach(td => {
-          td.classList.remove('multi-anchor-highlighted');
-        });
-      }
-    });
-  }
-
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
-
-  /**
-   * Renders the saved multi-anchored comments in the diff table. Comment threads
-   * will be inserted after the last anchored line for a given comment
-   *
-   * US3: Re-renders all saved comment threads and their associated line markers.
-   * Rebuilds from scratch to keep the DOM in sync with the in-memory store.
-   *
-   * @param {*} table - Gerrit diff table
-   */
-  function displaySavedComments(table) {
-    // Remove all existing comment threads first
-    table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
-
-    // Clear existing line markers (both anchored and highlighted)
-    table.querySelectorAll('td.multi-anchor-existing').forEach(td => {
-      td.classList.remove('multi-anchor-existing');
-    });
-    table.querySelectorAll('td.multi-anchor-highlighted').forEach(td => {
-      td.classList.remove('multi-anchor-highlighted');
-    });
-
-    // Display each saved comment
-    savedComments.forEach((comment, commentId) => {
-      const { lines, text, resolved } = comment;
-
-      // AC1: Mark all anchored lines
-      markAnchoredLines(table, lines);
-
-      // Create comment thread element
-      const lineLabels = lines.map(lk => {
-        const [side, num] = lk.split('-');
-        return `${side === 'left' ? 'L' : 'R'}${num}`;
-      }).join(', ');
-
-      const tr = document.createElement('tr');
-      tr.classList.add('multi-anchor-thread');
-      tr.dataset.commentId = commentId;
-      tr.innerHTML = `
-        <td colspan="2"></td>
-        <td colspan="2" style="padding: 0; border-top: 1px solid var(--border-color); overflow: hidden;">
-          <div style="
-            background-color: ${resolved ? 'rgb(232, 245, 233)' : 'rgb(254, 247, 224)'};
-            padding: var(--spacing-m);
-            font-family: var(--font-family), 'Roboto', Arial, sans-serif;
-            font-size: var(--font-size-normal, 1rem);
-            color: rgb(32, 33, 35);
-            overflow: hidden; word-wrap: break-word;
-          ">
-            <div style="margin-bottom: var(--spacing-s);">
-              <strong>${resolved ? '✓' : '💬'} Comment</strong> · Lines: ${lineLabels}
-              ${resolved ? '<span style="color: rgb(56, 142, 60); font-size: 0.9em; margin-left: var(--spacing-s);">(Resolved)</span>' : ''}
-            </div>
-            <div style="white-space: pre-wrap;">
-              ${escapeHtml(text)}
-            </div>
-            <div style="margin-top: var(--spacing-s); display: flex; gap: var(--spacing-s); justify-content: flex-end;">
-              <button class="ma-resolve-btn" style="
-                background: none; border: none; color: var(--link-color);
-                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-                font-weight: var(--font-weight-medium);
-              ">${resolved ? 'Unresolve' : 'Resolve'}</button>
-              <button class="ma-discard-btn" style="
-                background: none; border: none; color: rgb(217, 48, 37);
-                cursor: pointer; font: inherit; padding: 0 var(--spacing-s);
-                font-weight: var(--font-weight-medium);
-              ">Discard</button>
-            </div>
-          </div>
-        </td>
-      `;
-
-      // Resolve button handler
-      tr.querySelector('.ma-resolve-btn').addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        comment.resolved = !comment.resolved;
-        displaySavedComments(table);
-      });
-
-      // Discard button handler
-      tr.querySelector('.ma-discard-btn').addEventListener('click', async (ev) => {
-        ev.stopPropagation();
-
-        const btn = tr.querySelector('.ma-discard-btn');
-        btn.disabled = true;
-        btn.textContent = 'Deleting...';
-
-        try {
-          const success = await deleteMultiAnchorComment(commentId);
-          if (success) {
-            displaySavedComments(table);
-          } else {
-            btn.disabled = false;
-            btn.textContent = 'Discard';
-          }
-        } catch (error) {
-          btn.disabled = false;
-          btn.textContent = 'Discard';
-        }
-      });
-
-      // AC2: Add hover handlers to highlight associated lines (respects persistent toggle)
-      tr.addEventListener('mouseenter', () => {
-        highlightCommentLines(table, lines);
-      });
-
-      tr.addEventListener('mouseleave', () => {
-        // Only unhighlight if NOT persistently toggled on
-        if (!tr.classList.contains('active-highlight')) {
-          unhighlightCommentLines(table, lines);
-        }
-      });
-
-      // AC3: Click to toggle persistent highlight
-      tr.addEventListener('click', () => {
-        const isHighlighted = tr.classList.contains('active-highlight');
-        if (isHighlighted) {
-          tr.classList.remove('active-highlight');
-          unhighlightCommentLines(table, lines);
-        } else {
-          tr.classList.add('active-highlight');
-          highlightCommentLines(table, lines);
-        }
-      });
-
-      // Insert after the last anchored line
-      const lastLineKey = lines[lines.length - 1];
-      const [side, lineNum] = lastLineKey.split('-');
-      const lastRow = table.querySelector(`td.${side}.lineNum[data-value="${lineNum}"]`)?.closest('tr');
-      if (lastRow) {
-        lastRow.insertAdjacentElement('afterend', tr);
-      } else {
-        table.appendChild(tr);
-      }
-    });
-  }
-
-  /**
-   * Traverses Gerrit's nested shadow DOM to reach the diff table element.
-   * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
-   * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
-   *
-   * @returns {HTMLElement | null} - the diff element, or null if doesn't exist
-   * Traverses Gerrit's nested shadow DOM to reach the diff table element.
-   * Gerrit uses Polymer/Lit web components, so each layer is behind a shadowRoot.
-   * Returns null if any component hasn't rendered yet (handled by retry in attachListeners).
-   */
+  // ── Shadow-DOM traversal ───────────────────────────────────────────────────
   function getDiffElement() {
     try {
       return document.querySelector('gr-app').shadowRoot
@@ -796,97 +49,906 @@ Gerrit.install(plugin => {
         .querySelector('gr-diff-host').shadowRoot
         .querySelector('gr-diff').shadowRoot
         .querySelector('gr-diff-element');
-    }
-    catch (e) {
-      return null;
-    }
+    } catch { return null; }
   }
-
   function getGrDiffHost() {
     try {
       return document.querySelector('gr-app').shadowRoot
         .querySelector('gr-app-element').shadowRoot
         .querySelector('gr-diff-view').shadowRoot
         .querySelector('gr-diff-host');
-    }
-    catch (e) {
-      return null;
+    } catch { return null; }
+  }
+
+  // ── REST: Gerrit drafts ────────────────────────────────────────────────────
+  async function createDraft(changeNum, patchSet, path, range, message, unresolved) {
+    const body = { path, line: range.end_line, message, unresolved };
+    return restApi.put(`/changes/${changeNum}/revisions/${patchSet}/drafts`, body);
+  }
+
+  async function updateDraft(changeNum, patchSet, draftId, message, unresolved) {
+    const existing = await restApi.get(
+      `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`
+    );
+    const body = { ...existing, message, unresolved };
+    return restApi.put(
+      `/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`, body
+    );
+  }
+
+  async function deleteDraft(changeNum, patchSet, draftId) {
+    return restApi.delete(`/changes/${changeNum}/revisions/${patchSet}/drafts/${draftId}`);
+  }
+
+  // ── REST: Plugin multi-anchor storage ─────────────────────────────────────
+  async function saveAdditionalRanges(changeNum, commentUuid, ranges) {
+    return restApi.put(`/changes/${changeNum}/multianchor-ranges/${commentUuid}`, { ranges });
+  }
+  async function deleteAdditionalRanges(changeNum, commentUuid) {
+    return restApi.delete(`/changes/${changeNum}/multianchor-ranges/${commentUuid}`);
+  }
+  async function getAllAdditionalRanges(changeNum) {
+    return restApi.get(`/changes/${changeNum}/multianchor-ranges`);
+  }
+
+  // ── Load multi-anchor comments from backend ────────────────────────────────
+  const AI_PREFIX = '🤖 AI Review:';
+
+  async function loadMultiAnchorComments(changeNum, patchSet) {
+    try {
+      const [drafts, additionalRanges] = await Promise.all([
+        restApi.get(`/changes/${changeNum}/revisions/${patchSet}/drafts`),
+        getAllAdditionalRanges(changeNum),
+      ]);
+
+      savedComments.clear();
+
+      for (let [path, comments] of Object.entries(drafts || {})) {
+        path = path.replace(/^\[(.+?)\]\(.+?\)$/, '$1');
+        for (const comment of comments) {
+          const uuid        = comment.id;
+          const extraRanges = additionalRanges[uuid] || [];
+          const isAiComment = comment.message?.startsWith(AI_PREFIX);
+
+          if (extraRanges.length === 0 && !isAiComment) continue;
+
+          const primaryRange = comment.range ||
+            (comment.line
+              ? { start_line: comment.line, start_character: 0, end_line: comment.line, end_character: 0 }
+              : null);
+          const allRanges = primaryRange ? [primaryRange, ...extraRanges] : extraRanges;
+
+          const lines = allRanges.flatMap(r => {
+            const start = r.start_line ?? r.startLine;
+            const end   = r.end_line   ?? r.endLine;
+            if (start == null || end == null) return [];
+            const keys = [];
+            for (let l = start; l <= end; l++) keys.push(`right-${l}`);
+            return keys;
+          });
+
+          if (lines.length === 0) continue;
+
+          savedComments.set(uuid, {
+            id: uuid,
+            path,
+            lines,
+            text:             comment.message,
+            resolved:         comment.unresolved === false,
+            isDraft:          true,
+            primaryRange,
+            additionalRanges: extraRanges,
+          });
+        }
+      }
+      return savedComments;
+    } catch (e) {
+      return savedComments;
     }
   }
 
-  /**
-   * Hides any native Gerrit comment threads whose rootId is in savedComments.
-   * Multi-anchor comments are rendered by the plugin, so the native thread is redundant.
-   */
-  function hideNativeThreadsForMultiAnchor(root) {
-    if (savedComments.size === 0) return;
-    root.querySelectorAll('gr-comment-thread').forEach(threadEl => {
-      try {
-        const thread = threadEl.thread;
-        if (!thread) return;
-        const rootId = thread.rootId ||
-          (thread.comments && thread.comments[0] && thread.comments[0].id);
-        if (rootId && savedComments.has(rootId)) {
-          threadEl.style.display = 'none';
-          const tr = threadEl.closest('tr');
-          if (tr) tr.style.display = 'none';
+  // ── Line-key helpers ───────────────────────────────────────────────────────
+  function lineKeysToRanges(lineKeys, side) {
+    const nums = [...lineKeys]
+      .filter(k => k.startsWith(side))
+      .map(k => parseInt(k.split('-')[1], 10))
+      .sort((a, b) => a - b);
+    if (!nums.length) return [];
+    const ranges = [];
+    let s = nums[0], e = nums[0];
+    for (let i = 1; i < nums.length; i++) {
+      if (nums[i] === e + 1) { e = nums[i]; }
+      else { ranges.push({ start_line: s, start_character: 0, end_line: e, end_character: 0 }); s = e = nums[i]; }
+    }
+    ranges.push({ start_line: s, start_character: 0, end_line: e, end_character: 0 });
+    return ranges;
+  }
+
+  // ── Create / delete multi-anchor comments ─────────────────────────────────
+  async function createMultiAnchorComment(selectedLines, message, resolved) {
+    const changeNum = getChangeNumber();
+    const patchSet  = getPatchSetNumber();
+    const path      = getFilePath();
+    if (!changeNum || !path) return null;
+
+    const rightLines = [...selectedLines].filter(k => k.startsWith('right'));
+    const leftLines  = [...selectedLines].filter(k => k.startsWith('left'));
+    const side       = rightLines.length >= leftLines.length ? 'right' : 'left';
+    const allRanges  = lineKeysToRanges(selectedLines, side);
+    if (!allRanges.length) return null;
+
+    try {
+      const draft = await createDraft(changeNum, patchSet, path, allRanges[0], message, !resolved);
+      if (allRanges.length > 1) {
+        await saveAdditionalRanges(changeNum, draft.id, allRanges.slice(1));
+      }
+      savedComments.set(draft.id, {
+        id: draft.id, path, lines: [...selectedLines], text: message,
+        resolved, isDraft: true,
+        primaryRange:     allRanges[0],
+        additionalRanges: allRanges.slice(1),
+      });
+      return draft;
+    } catch { return null; }
+  }
+
+  async function deleteMultiAnchorComment(commentId) {
+    const changeNum = getChangeNumber();
+    const patchSet  = getPatchSetNumber();
+    if (!changeNum) return false;
+    try {
+      await deleteDraft(changeNum, patchSet, commentId);
+      await deleteAdditionalRanges(changeNum, commentId);
+      savedComments.delete(commentId);
+      return true;
+    } catch { return false; }
+  }
+
+  // ── Global styles ─────────────────────────────────────────────────────────
+  function injectStyles(diffElement) {
+    const existing = diffElement.querySelector('#ma-styles');
+    if (existing) existing.remove();
+    const s = document.createElement('style');
+    s.id = 'ma-styles';
+    s.textContent = `
+      /* Selected lines (Ctrl+click) */
+      td.multi-anchor-selected div.contentText      { background: rgba(255,200,0,.30) !important; }
+      td.multi-anchor-selected button.lineNumButton { background: rgba(255,200,0,.30) !important; }
+
+      /* Anchored lines (saved comment) */
+      td.multi-anchor-existing div.contentText      { border-left:3px solid #1967d2 !important; background:rgba(66,133,244,.12) !important; }
+      td.multi-anchor-existing button.lineNumButton { background:rgba(66,133,244,.15) !important; }
+
+      /* Hover / click highlight */
+      td.multi-anchor-highlighted div.contentText      { background:rgba(66,133,244,.30) !important; border-left:3px solid #1967d2 !important; }
+      td.multi-anchor-highlighted button.lineNumButton { background:rgba(66,133,244,.30) !important; }
+
+      /* Range badge pill */
+      .ma-range-badge {
+        display:inline-block; margin-left:4px; padding:1px 5px;
+        background:#1967d2; color:#fff; border-radius:10px;
+        font-size:10px; font-weight:600; line-height:1.4; vertical-align:middle;
+        pointer-events:none;
+      }
+
+      .multi-anchor-thread { cursor: pointer; }
+
+      /* ── Shared card chrome ── */
+      .ma-card {
+        background: rgb(254,247,224);
+        font-family: var(--font-family), 'Roboto', Arial, sans-serif;
+        font-size: var(--font-size-normal, 13px);
+        color: var(--primary-text-color, #202124);
+        overflow: hidden;
+        word-wrap: break-word;
+      }
+      .ma-card.resolved { background: rgb(232,245,233); }
+
+      /* Header row */
+      .ma-card-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: var(--spacing-m) var(--spacing-m) var(--spacing-s);
+        border-bottom: 1px solid rgba(0,0,0,.07);
+      }
+      .ma-card-header-icon {
+        font-size: 15px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      .ma-card-header-title {
+        font-weight: 600;
+        font-size: var(--font-size-normal, 13px);
+        letter-spacing: .01em;
+      }
+      .ma-card-header-meta {
+        font-size: 11px;
+        color: var(--deemphasized-text-color, #80868b);
+        font-weight: 400;
+        margin-left: 2px;
+      }
+      .ma-card-header-tag {
+        display: inline-flex;
+        align-items: center;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        padding: 1px 6px;
+        border-radius: 3px;
+        margin-left: 2px;
+      }
+      .ma-card-header-tag.ai   { background: #e8f0fe; color: #1967d2; }
+      .ma-card-header-tag.draft { background: rgba(0,0,0,.06); color: #5f6368; }
+      .ma-card-header-right {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--deemphasized-text-color, #80868b);
+        white-space: nowrap;
+      }
+
+      /* Body */
+      .ma-card-body {
+        padding: var(--spacing-m);
+        white-space: pre-wrap;
+        line-height: 1.55;
+        font-size: var(--font-size-normal, 13px);
+        border-bottom: 1px solid rgba(0,0,0,.07);
+      }
+
+      /* Edit area */
+      .ma-card-edit {
+        display: none;
+        padding: var(--spacing-m);
+        border-bottom: 1px solid rgba(0,0,0,.07);
+      }
+      .ma-card-edit textarea {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 80px;
+        resize: vertical;
+        font: inherit;
+        font-size: var(--font-size-normal, 13px);
+        padding: var(--spacing-s);
+        background: #fff;
+        border: 1px solid var(--border-color, #dadce0);
+        border-radius: 4px;
+        color: var(--primary-text-color, #202124);
+        outline: none;
+        transition: border-color .15s;
+      }
+      .ma-card-edit textarea:focus { border-color: #1967d2; }
+      .ma-card-edit-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--spacing-s);
+        margin-top: var(--spacing-s);
+      }
+
+      /* Footer */
+      .ma-card-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: var(--spacing-s) var(--spacing-m);
+      }
+      .ma-resolved-label {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-s);
+        font-size: var(--font-size-normal, 13px);
+        color: var(--primary-text-color, #202124);
+        cursor: pointer;
+        user-select: none;
+      }
+      .ma-resolved-label input[type="checkbox"] {
+        width: 14px; height: 14px;
+        cursor: pointer;
+        accent-color: #1967d2;
+        margin: 0;
+      }
+      .ma-card-actions {
+        display: flex;
+        gap: 2px;
+        align-items: center;
+      }
+
+      /* Buttons */
+      .ma-btn {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font: inherit;
+        font-size: var(--font-size-normal, 13px);
+        font-weight: 500;
+        padding: 3px 6px;
+        border-radius: 3px;
+        color: var(--link-color, #1967d2);
+        transition: background .12s;
+        line-height: 1.4;
+      }
+      .ma-btn:hover { background: rgba(25,103,210,.1); }
+      .ma-btn:disabled { opacity: .5; cursor: default; }
+      .ma-btn.danger { color: rgb(217,48,37); }
+      .ma-btn.danger:hover { background: rgba(217,48,37,.08); }
+      .ma-btn.muted  { color: var(--deemphasized-text-color, #80868b); }
+      .ma-btn.muted:hover { background: rgba(0,0,0,.06); }
+    `;
+    diffElement.appendChild(s);
+  }
+
+  // ── FAB + AI panel ────────────────────────────────────────────────────────
+  let fabEl  = null;
+  let panelEl = null;
+  let logEl   = null;
+
+  function injectAiPanel() {
+    if (document.getElementById('ma-ai-fab')) return;
+
+    // FAB
+    const fab = document.createElement('button');
+    fab.id = 'ma-ai-fab';
+    fab.innerHTML = '🤖';
+    fab.title = 'AI Code Review (Ctrl+Shift+A)';
+    Object.assign(fab.style, {
+      position: 'fixed', bottom: '24px', right: '24px', zIndex: '9999',
+      width: '56px', height: '56px', borderRadius: '50%',
+      background: '#1a73e8', color: '#fff', border: 'none',
+      cursor: 'pointer', fontSize: '22px',
+      boxShadow: '0 4px 12px rgba(0,0,0,.35)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      transition: 'transform .15s',
+    });
+    fab.addEventListener('mouseenter', () => fab.style.transform = 'scale(1.08)');
+    fab.addEventListener('mouseleave', () => fab.style.transform = '');
+    fab.addEventListener('click', togglePanel);
+    document.body.appendChild(fab);
+    fabEl = fab;
+
+    // Panel
+    const panel = document.createElement('div');
+    panel.id = 'ma-ai-panel';
+    Object.assign(panel.style, {
+      position: 'fixed', bottom: '88px', right: '24px', zIndex: '9999',
+      width: '360px', background: '#fff', borderRadius: '12px',
+      boxShadow: '0 8px 32px rgba(0,0,0,.22)',
+      display: 'none', flexDirection: 'column', overflow: 'hidden',
+      fontFamily: "var(--font-family),'Roboto',Arial,sans-serif",
+    });
+
+    panel.innerHTML = `
+      <div style="background:#1a73e8;color:#fff;padding:14px 16px 10px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">🤖</span>
+        <span style="flex:1;font-size:15px;font-weight:500;">AI Code Review</span>
+        <button id="ma-panel-close" style="background:none;border:none;color:rgba(255,255,255,.8);cursor:pointer;font-size:20px;line-height:1;padding:0;" title="Close">×</button>
+      </div>
+      <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+        <div>
+          <label style="font-size:11px;color:#5f6368;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px;">Focus area (optional)</label>
+          <textarea id="ma-prompt-input" rows="3" placeholder="e.g. Focus on null safety and error handling…"
+            style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #dadce0;border-radius:6px;font:inherit;font-size:13px;resize:vertical;transition:border-color .2s;outline:none;"></textarea>
+        </div>
+        <div id="ma-history-row" style="display:none;">
+          <label style="font-size:11px;color:#5f6368;display:block;margin-bottom:3px;">Recent prompts</label>
+          <select id="ma-history-select" style="width:100%;padding:5px 8px;border:1px solid #dadce0;border-radius:6px;font-size:12px;color:#444;background:#fafafa;">
+            <option value="">— select a previous prompt —</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button id="ma-review-btn" style="flex:1;padding:9px 0;background:#1a73e8;color:#fff;border:none;border-radius:6px;font:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:background .2s;">
+            Run AI Review
+          </button>
+          <button id="ma-clear-btn" title="Clear history" style="padding:9px 12px;background:#f1f3f4;color:#5f6368;border:none;border-radius:6px;font:inherit;font-size:12px;cursor:pointer;">🗑</button>
+        </div>
+        <div id="ma-log" style="display:none;background:#f8f9fa;border-radius:6px;padding:10px;font-size:12px;color:#3c4043;max-height:160px;overflow-y:auto;line-height:1.6;font-family:monospace;"></div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+    panelEl = panel;
+    logEl   = panel.querySelector('#ma-log');
+
+    panel.querySelector('#ma-panel-close').addEventListener('click', closePanel);
+    panel.querySelector('#ma-review-btn').addEventListener('click', runAiReview);
+    panel.querySelector('#ma-clear-btn').addEventListener('click', () => {
+      localStorage.removeItem(HISTORY_KEY);
+      refreshHistoryDropdown();
+    });
+    panel.querySelector('#ma-prompt-input').addEventListener('focus', e => e.target.style.borderColor = '#1a73e8');
+    panel.querySelector('#ma-prompt-input').addEventListener('blur',  e => e.target.style.borderColor = '#dadce0');
+    panel.querySelector('#ma-history-select').addEventListener('change', e => {
+      if (e.target.value) panel.querySelector('#ma-prompt-input').value = e.target.value;
+    });
+
+    refreshHistoryDropdown();
+  }
+
+  function refreshHistoryDropdown() {
+    if (!panelEl) return;
+    const sel  = panelEl.querySelector('#ma-history-select');
+    const row  = panelEl.querySelector('#ma-history-row');
+    const hist = loadHistory();
+    if (!hist.length) { row.style.display = 'none'; return; }
+    row.style.display = 'block';
+    sel.innerHTML = '<option value="">— select a previous prompt —</option>' +
+      hist.map(p => `<option value="${escHtml(p)}">${escHtml(p.slice(0,60))}${p.length>60?'…':''}</option>`).join('');
+  }
+
+  function togglePanel() {
+    if (!panelEl) return;
+    const open = panelEl.style.display !== 'none';
+    panelEl.style.display = open ? 'none' : 'flex';
+    if (!open) panelEl.querySelector('#ma-prompt-input').focus();
+  }
+  function closePanel() { if (panelEl) panelEl.style.display = 'none'; }
+
+  function logMsg(msg, type = 'info') {
+    if (!logEl) return;
+    logEl.style.display = 'block';
+    const colors   = { info:'#3c4043', ok:'#2e7d32', err:'#c62828', muted:'#80868b' };
+    const prefixes = { info:'▸ ', ok:'✓ ', err:'✗ ', muted:'  ' };
+    const line = document.createElement('div');
+    line.style.color = colors[type] || colors.info;
+    line.textContent = (prefixes[type]||'') + msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function clearLog() { if (logEl) { logEl.innerHTML = ''; logEl.style.display = 'none'; } }
+
+  // ── Run AI review ─────────────────────────────────────────────────────────
+  async function runAiReview() {
+    const changeNum = getChangeNumber();
+    const patchSet  = getPatchSetNumber();
+    if (!changeNum) { logMsg('Cannot detect change number from URL', 'err'); return; }
+
+    const btn    = panelEl.querySelector('#ma-review-btn');
+    const prompt = panelEl.querySelector('#ma-prompt-input').value.trim();
+
+    btn.disabled    = true;
+    btn.textContent = 'Reviewing…';
+    clearLog();
+    logMsg('Sending diff to AI…');
+
+    try {
+      pushHistory(prompt);
+      refreshHistoryDropdown();
+
+      const result = await restApi.post(
+        `/changes/${changeNum}/revisions/${patchSet}/ai-review`,
+        { prompt }
+      );
+
+      logMsg(typeof result === 'string' ? result : 'AI review complete.', 'ok');
+      logMsg('Loading comment data…', 'muted');
+
+      await loadMultiAnchorComments(changeNum, patchSet);
+      setupNativeThreadHider();
+
+      logMsg('Refreshing diff view…', 'muted');
+
+      const grDiffHost = getGrDiffHost();
+      if (grDiffHost) {
+        grDiffHost.dispatchEvent(new CustomEvent('reload', {
+          bubbles: true, composed: true, detail: { clearPatchset: false }
+        }));
+      }
+
+      let diffElement = null;
+      let table = null;
+      for (let i = 0; i < 30; i++) {
+        await delay(150);
+        diffElement = getDiffElement();
+        table = diffElement?.querySelector('table#diffTable');
+        if (table) break;
+      }
+      if (diffElement) injectStyles(diffElement);
+      if (table) displaySavedComments(table);
+
+      updateFabBadge();
+      logMsg('Done — AI drafts are now visible below the diff.', 'ok');
+
+      btn.textContent = '✓ Done';
+      setTimeout(() => { btn.disabled = false; btn.textContent = 'Run AI Review'; }, 3000);
+
+    } catch (err) {
+      logMsg('Error: ' + (err.message || String(err)), 'err');
+      btn.disabled    = false;
+      btn.textContent = 'Run AI Review';
+    }
+  }
+
+  function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // ── FAB badge ─────────────────────────────────────────────────────────────
+  function updateFabBadge() {
+    if (!fabEl) return;
+    fabEl.querySelector('.ma-fab-badge')?.remove();
+    const n = savedComments.size;
+    if (!n) return;
+    const badge = document.createElement('span');
+    badge.className = 'ma-fab-badge';
+    Object.assign(badge.style, {
+      position:'absolute', top:'6px', right:'6px',
+      background:'#ea4335', color:'#fff',
+      borderRadius:'8px', fontSize:'10px', fontWeight:'700',
+      padding:'1px 5px', lineHeight:'1.4', pointerEvents:'none',
+    });
+    badge.textContent = n;
+    fabEl.style.position = 'relative';
+    fabEl.appendChild(badge);
+  }
+
+  // ── Keyboard shortcut ─────────────────────────────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (e.ctrlKey && e.shiftKey && e.key === 'A') { e.preventDefault(); togglePanel(); }
+  });
+
+  // ── Native-thread hider ────────────────────────────────────────────────────
+  let nativeObserver = null;
+  let hidePoller     = null;
+
+  function setupNativeThreadHider() {
+    const grDiffHost = getGrDiffHost();
+    if (!grDiffHost?.shadowRoot) return;
+    if (nativeObserver) nativeObserver.disconnect();
+    clearInterval(hidePoller);
+    const root = grDiffHost.shadowRoot;
+
+    injectHiderStyle(root);
+
+    const hideAll = () => {
+      root.querySelectorAll('gr-comment-thread').forEach(el => {
+        try {
+          if (el.dataset.maHidden) return;
+          let shouldHide = false;
+
+          const thread = el.thread;
+          if (thread) {
+            const rootId   = thread.rootId || thread.comments?.[0]?.id;
+            const firstMsg = thread.comments?.[0]?.message || '';
+            shouldHide = (rootId && savedComments.has(rootId)) || firstMsg.startsWith(AI_PREFIX);
+          }
+          if (!shouldHide && (el.innerText || '').includes('🤖 AI Review:')) shouldHide = true;
+          if (!shouldHide && el.shadowRoot?.innerHTML.includes('🤖 AI Review:')) shouldHide = true;
+
+          if (shouldHide) {
+            el.dataset.maHidden = '1';
+            el.style.display = 'none';
+            const tr = el.closest('tr');
+            if (tr) tr.style.display = 'none';
+          }
+        } catch { /* element mid-upgrade */ }
+      });
+    };
+
+    nativeObserver = new MutationObserver(() => {
+      hideAll();
+      setTimeout(hideAll, 50);
+      setTimeout(hideAll, 150);
+      setTimeout(hideAll, 400);
+    });
+    nativeObserver.observe(root, { childList: true, subtree: true });
+
+    let pollCount = 0;
+    hidePoller = setInterval(() => {
+      hideAll();
+      if (++pollCount >= 40) clearInterval(hidePoller);
+    }, 100);
+  }
+
+  function injectHiderStyle(shadowRoot) {
+    if (shadowRoot.querySelector('#ma-hider-style')) return;
+    const s = document.createElement('style');
+    s.id = 'ma-hider-style';
+    s.textContent = `
+      gr-comment-thread[data-ma-hidden="1"] { display: none !important; }
+      tr:has(gr-comment-thread[data-ma-hidden="1"]) { display: none !important; }
+    `;
+    shadowRoot.appendChild(s);
+  }
+
+  // ── Diff table helpers ────────────────────────────────────────────────────
+  function escHtml(t) {
+    const d = document.createElement('div');
+    d.textContent = t;
+    return d.innerHTML;
+  }
+
+  function markAnchoredLines(table, lines) {
+    lines.forEach(key => {
+      const [side, num] = key.split('-');
+      table.querySelector(`td.${side}.lineNum[data-value="${num}"]`)
+        ?.closest('tr')
+        ?.querySelectorAll(`td.${side}`)
+        .forEach(td => td.classList.add('multi-anchor-existing'));
+    });
+  }
+
+  function addRangeBadge(table, lines) {
+    const first = lines[0];
+    if (!first) return;
+    const [side, num] = first.split('-');
+    const btn = table.querySelector(`td.${side}.lineNum[data-value="${num}"] button.lineNumButton`);
+    if (!btn || btn.querySelector('.ma-range-badge')) return;
+    const badge = document.createElement('span');
+    badge.className = 'ma-range-badge';
+    badge.title = `Multi-anchor: ${lines.length} line ranges`;
+    badge.textContent = `×${lines.length}`;
+    btn.appendChild(badge);
+  }
+
+  function highlightLines(table, lines, on) {
+    lines.forEach(key => {
+      const [side, num] = key.split('-');
+      table.querySelector(`td.${side}.lineNum[data-value="${num}"]`)
+        ?.closest('tr')
+        ?.querySelectorAll(`td.${side}`)
+        .forEach(td => td.classList.toggle('multi-anchor-highlighted', on));
+    });
+  }
+
+  // ── Display saved comments ─────────────────────────────────────────────────
+  function displaySavedComments(table) {
+    const diffElement = getDiffElement();
+    if (diffElement) injectStyles(diffElement);
+
+    table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
+    table.querySelectorAll('td.multi-anchor-existing, td.multi-anchor-highlighted').forEach(td => {
+      td.classList.remove('multi-anchor-existing', 'multi-anchor-highlighted');
+    });
+    table.querySelectorAll('.ma-range-badge').forEach(b => b.remove());
+
+    savedComments.forEach((comment, commentId) => {
+      const { lines, text, resolved } = comment;
+      const isAi = text.startsWith('🤖 AI Review:');
+
+      markAnchoredLines(table, lines);
+      addRangeBadge(table, lines);
+
+      const lineLabel = lines.map(k => {
+        const [s, n] = k.split('-');
+        return `${s === 'left' ? 'L' : 'R'}${n}`;
+      }).join(', ');
+
+      const displayText = isAi ? text.replace(/^🤖 AI Review:\n\n/, '') : text;
+
+      const tr = document.createElement('tr');
+      tr.className = 'multi-anchor-thread';
+      tr.dataset.commentId = commentId;
+
+      // ── Card HTML ──────────────────────────────────────────────────────
+      // colspan="3" + single <td> matches the native thread column width
+      tr.innerHTML = `
+        <td colspan="3"></td>
+        <td style="padding:0; border-top:1px solid var(--border-color); overflow:hidden;">
+          <div class="ma-card${resolved ? ' resolved' : ''}">
+
+            <div class="ma-card-header">
+              <span class="ma-card-header-icon">${isAi ? '🤖' : '✏️'}</span>
+              <span class="ma-card-header-title">${isAi ? 'AI Review' : 'Draft'}</span>
+              <span class="ma-card-header-tag ${isAi ? 'ai' : 'draft'}">${isAi ? 'AI' : 'Draft'}</span>
+              <span class="ma-card-header-meta">· ${escHtml(lineLabel)}</span>
+              <span class="ma-card-header-right">${new Date().toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}</span>
+            </div>
+
+            <div class="ma-card-body">${escHtml(displayText)}</div>
+
+            <div class="ma-card-edit">
+              <textarea class="ma-edit-textarea">${escHtml(displayText)}</textarea>
+              <div class="ma-card-edit-actions">
+                <button class="ma-btn muted ma-edit-cancel">Cancel</button>
+                <button class="ma-btn ma-edit-save">Save draft</button>
+              </div>
+            </div>
+
+            <div class="ma-card-footer">
+              <label class="ma-resolved-label">
+                <input type="checkbox" class="ma-resolve-checkbox" ${resolved ? 'checked' : ''}>
+                Resolved
+              </label>
+              <div class="ma-card-actions">
+                <button class="ma-btn ma-edit-btn">Edit</button>
+                <button class="ma-btn danger ma-discard-btn">Discard</button>
+              </div>
+            </div>
+
+          </div>
+        </td>
+      `;
+
+      // ── Wire up ────────────────────────────────────────────────────────
+      const card     = tr.querySelector('.ma-card');
+      const body     = tr.querySelector('.ma-card-body');
+      const editArea = tr.querySelector('.ma-card-edit');
+      const textarea = tr.querySelector('.ma-edit-textarea');
+
+      tr.querySelector('.ma-resolve-checkbox').addEventListener('change', async ev => {
+        ev.stopPropagation();
+        comment.resolved = ev.target.checked;
+        card.classList.toggle('resolved', comment.resolved);
+        try {
+          await updateDraft(
+            getChangeNumber(), getPatchSetNumber(), commentId,
+            isAi ? '🤖 AI Review:\n\n' + displayText : displayText,
+            !comment.resolved
+          );
+        } catch { /* non-critical */ }
+        displaySavedComments(table);
+      });
+
+      tr.querySelector('.ma-edit-btn').addEventListener('click', ev => {
+        ev.stopPropagation();
+        body.style.display     = 'none';
+        editArea.style.display = 'block';
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      });
+
+      tr.querySelector('.ma-edit-cancel').addEventListener('click', ev => {
+        ev.stopPropagation();
+        body.style.display     = '';
+        editArea.style.display = 'none';
+      });
+
+      tr.querySelector('.ma-edit-save').addEventListener('click', async ev => {
+        ev.stopPropagation();
+        const newText = textarea.value.trim();
+        if (!newText) return;
+        const btn = tr.querySelector('.ma-edit-save');
+        btn.disabled = true; btn.textContent = 'Saving…';
+        try {
+          const storageText = isAi ? '🤖 AI Review:\n\n' + newText : newText;
+          await updateDraft(getChangeNumber(), getPatchSetNumber(), commentId, storageText, !comment.resolved);
+          comment.text = storageText;
+          displaySavedComments(table);
+        } catch {
+          btn.disabled = false; btn.textContent = 'Save draft';
         }
-      } catch (e) {
-        // ignore — thread property may not be set yet
+      });
+
+      tr.querySelector('.ma-discard-btn').addEventListener('click', async ev => {
+        ev.stopPropagation();
+        const btn = tr.querySelector('.ma-discard-btn');
+        btn.disabled = true; btn.textContent = 'Deleting…';
+        const ok = await deleteMultiAnchorComment(commentId);
+        if (ok) { displaySavedComments(table); updateFabBadge(); }
+        else    { btn.disabled = false; btn.textContent = 'Discard'; }
+      });
+
+      tr.addEventListener('mouseenter', () => highlightLines(table, lines, true));
+      tr.addEventListener('mouseleave', () => {
+        if (!tr.classList.contains('ma-active')) highlightLines(table, lines, false);
+      });
+      tr.addEventListener('click', () => {
+        const on = tr.classList.toggle('ma-active');
+        highlightLines(table, lines, on);
+      });
+
+      const lastKey = lines[lines.length - 1];
+      const lastRow = lastKey
+        ? (() => {
+            const [s, n] = lastKey.split('-');
+            return table.querySelector(`td.${s}.lineNum[data-value="${n}"]`)?.closest('tr');
+          })()
+        : null;
+      (lastRow || table).insertAdjacentElement('afterend', tr);
+    });
+
+    updateFabBadge();
+  }
+
+  // ── Manual multi-anchor selection ─────────────────────────────────────────
+  const selectedLines = new Set();
+
+  function toggleLine(key, side, row) {
+    if (selectedLines.has(key)) {
+      selectedLines.delete(key);
+      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.remove('multi-anchor-selected'));
+    } else {
+      selectedLines.add(key);
+      row.querySelectorAll(`td.${side}`).forEach(td => td.classList.add('multi-anchor-selected'));
+    }
+  }
+
+  function clearSelection(table) {
+    selectedLines.clear();
+    table.querySelectorAll('td.multi-anchor-selected').forEach(td => td.classList.remove('multi-anchor-selected'));
+  }
+
+  // ── Comment-draft box ─────────────────────────────────────────────────────
+  function showCommentBox(table, lines) {
+    table.querySelector('tr.multi-anchor-comment-row')?.remove();
+
+    const lineLabel = [...lines].map(k => {
+      const [s, n] = k.split('-');
+      return `${s === 'left' ? 'L' : 'R'}${n}`;
+    }).join(', ');
+
+    const tr = document.createElement('tr');
+    tr.className = 'multi-anchor-comment-row';
+
+    // Same colspan="3" + single td as saved comments for consistent width
+    tr.innerHTML = `
+      <td colspan="3"></td>
+      <td style="padding:0; border-top:1px solid var(--border-color); overflow:hidden;">
+        <div class="ma-card">
+          <div class="ma-card-header">
+            <span class="ma-card-header-icon">✏️</span>
+            <span class="ma-card-header-title">New draft</span>
+            <span class="ma-card-header-tag draft">Draft</span>
+            <span class="ma-card-header-meta">· ${escHtml(lineLabel)}</span>
+          </div>
+          <div style="padding: var(--spacing-m);">
+            <textarea class="ma-new-textarea" rows="4" placeholder="Write a review comment…" style="
+              display:block; width:100%; box-sizing:border-box; font:inherit;
+              font-size:var(--font-size-normal,13px);
+              padding: var(--spacing-s);
+              background:#fff; border:1px solid var(--border-color,#dadce0);
+              border-radius:4px; resize:vertical; color:var(--primary-text-color,#202124);
+              outline:none; transition:border-color .15s;
+            "></textarea>
+          </div>
+          <div class="ma-card-footer">
+            <label class="ma-resolved-label">
+              <input type="checkbox" class="ma-new-resolved">
+              Mark as resolved
+            </label>
+            <div class="ma-card-actions">
+              <button class="ma-btn muted ma-new-cancel">Cancel</button>
+              <button class="ma-btn ma-new-save">Save draft</button>
+            </div>
+          </div>
+        </div>
+      </td>
+    `;
+
+    const lastKey = [...lines][lines.size - 1];
+    const [lastSide, lastNum] = lastKey.split('-');
+    const lastRow = table.querySelector(`td.${lastSide}.lineNum[data-value="${lastNum}"]`)?.closest('tr');
+    (lastRow || table).insertAdjacentElement('afterend', tr);
+
+    const textarea = tr.querySelector('.ma-new-textarea');
+    textarea.focus();
+    textarea.addEventListener('focus', () => textarea.style.borderColor = '#1967d2');
+    textarea.addEventListener('blur',  () => textarea.style.borderColor = 'var(--border-color,#dadce0)');
+
+    tr.querySelector('.ma-new-cancel').addEventListener('click', () => {
+      tr.remove(); clearSelection(table);
+    });
+
+    tr.querySelector('.ma-new-save').addEventListener('click', async () => {
+      const text     = textarea.value.trim();
+      const resolved = tr.querySelector('.ma-new-resolved').checked;
+      if (!text) return;
+      const saveBtn = tr.querySelector('.ma-new-save');
+      saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+      const draft = await createMultiAnchorComment(lines, text, resolved);
+      if (draft) {
+        tr.remove(); clearSelection(table);
+        displaySavedComments(table);
+      } else {
+        saveBtn.disabled = false; saveBtn.textContent = 'Save draft';
       }
     });
   }
 
-  /**
-   * Sets up a MutationObserver on the gr-diff-host shadow root so that native
-   * Gerrit comment threads for multi-anchor comments are hidden whenever Gerrit
-   * (re-)renders them.
-   */
-  function setupNativeThreadHider() {
-    const grDiffHost = getGrDiffHost();
-    if (!grDiffHost || !grDiffHost.shadowRoot) return;
-
-    const root = grDiffHost.shadowRoot;
-
-    // Run once immediately in case threads are already rendered
-    hideNativeThreadsForMultiAnchor(root);
-
-    const observer = new MutationObserver(() => {
-      hideNativeThreadsForMultiAnchor(root);
-    });
-    observer.observe(root, {childList: true, subtree: true});
-  }
-
-  /**
-   * Attaches click and keyboard listeners to the diff table once it's available.
-   * Retries via setTimeout if the diff hasn't rendered yet (Gerrit loads lazily).
-   * system, including:
-   *  - polling for diff elements/table
-   *  - providing styles for the plugin
-   *  - renders saved comments when it's loaded
-   *  - handles multi-line selection and keyboard shortcuts
-   *
-   * @returns {void}
-   */
+  // ── Attach everything to the diff table ──────────────────────────────────
   function attachListeners() {
     const diffElement = getDiffElement();
-    if (!diffElement) {
-      setTimeout(attachListeners, 500);
-      return;
-    }
+    if (!diffElement) { setTimeout(attachListeners, 500); return; }
 
     injectStyles(diffElement);
-    injectAiReviewButton(diffElement);
+    injectAiPanel();
 
     const table = diffElement.querySelector('table#diffTable');
-    if (!table) {
-      setTimeout(attachListeners, 500);
-      return;
-    }
+    if (!table) { setTimeout(attachListeners, 500); return; }
 
-    // Load and display comments from backend on initial load
+    setupNativeThreadHider();
+
     const changeNum = getChangeNumber();
-    const patchSet = getPatchSetNumber();
+    const patchSet  = getPatchSetNumber();
     if (changeNum) {
       loadMultiAnchorComments(changeNum, patchSet).then(() => {
         displaySavedComments(table);
@@ -894,90 +956,35 @@ Gerrit.install(plugin => {
       });
     }
 
-    // US1 + US5: Only intercept clicks with Ctrl/Cmd held, so normal Gerrit
-    // interactions (single-line comments, navigation) are unaffected.
-    table.addEventListener('click', function (e) {
-      if (!e.ctrlKey && !e.metaKey) {
-        return;
-      }
-
+    table.addEventListener('click', e => {
+      if (!e.ctrlKey && !e.metaKey) return;
       const row = e.target.closest('tr');
-      if (!row) {
-        return;
-      }
-
-      const isRight = e.target.closest('td.right') !== null;
-      const isLeft = e.target.closest('td.left') !== null;
-      if (!isRight && !isLeft) {
-        return;
-      }
-
+      if (!row) return;
+      const isRight = !!e.target.closest('td.right');
+      const isLeft  = !!e.target.closest('td.left');
+      if (!isRight && !isLeft) return;
       const side = isRight ? 'right' : 'left';
-
-      const lineNumCell = row.querySelector(`td.${side}.lineNum`);
-
-      if (!lineNumCell) {
-        return;
-      }
-
-      const lineNum = lineNumCell.dataset.value;
-      if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE') {
-        return;
-      }
-
-      const lineKey = `${side}-${lineNum}`;
-      toggleLine(lineKey, side, row);
-
-      e.preventDefault();
-      e.stopPropagation();
+      const cell = row.querySelector(`td.${side}.lineNum`);
+      const num  = cell?.dataset.value;
+      if (!num || num === 'LOST' || num === 'FILE') return;
+      toggleLine(`${side}-${num}`, side, row);
+      e.preventDefault(); e.stopPropagation();
     });
 
-    // US2: 'c' opens a comment box; Escape dismisses it. Uses capture phase
-    // to intercept before Gerrit's own 'c' shortcut (single-line comment).
-    document.addEventListener('keydown', function (e) {
-      // Block if typing in any text field (check both target and active element)
-      const tag = e.target.tagName;
-      const activeTag = document.activeElement && document.activeElement.tagName;
-      if (tag === 'TEXTAREA' || tag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'INPUT') {
-        return;
-      }
-
-      // Also block if a comment box is already open
-      if (e.key === 'c' && table.querySelector('tr.multi-anchor-comment-row')) {
-        return;
-      }
-
+    document.addEventListener('keydown', e => {
+      const tag = (e.target?.tagName || '').toUpperCase();
+      if (tag === 'TEXTAREA' || tag === 'INPUT') return;
       if (e.key === 'c' && selectedLines.size > 0) {
-        e.stopImmediatePropagation();
-        e.preventDefault();
+        if (table.querySelector('tr.multi-anchor-comment-row')) return;
+        e.stopImmediatePropagation(); e.preventDefault();
         showCommentBox(table, selectedLines);
       }
       if (e.key === 'Escape') {
-        const existing = table.querySelector('tr.multi-anchor-comment-row');
-        if (existing) {
-          existing.remove();
-          clearSelection(table);
-        }
+        table.querySelector('tr.multi-anchor-comment-row')?.remove();
+        clearSelection(table);
       }
     }, true);
   }
 
   setTimeout(attachListeners, 1000);
-
-  // add a button to the Gerrit toolbar
-  async function triggerAiReview() {
-    const changeNum = getChangeNumber();
-    const patchSet  = getPatchSetNumber();
-    if (!changeNum) return;
-
-    const endpoint = `/changes/${changeNum}/revisions/${patchSet}/ai-review`;
-    await restApi.post(endpoint, { prompt: '' });
-
-    // reload so the new robot comments
-    const table = getDiffElement()?.querySelector('table#diffTable');
-    if (table) {
-      await loadMultiAnchorComments(changeNum, patchSet);
-      displaySavedComments(table);
-    }
-  }
 });
