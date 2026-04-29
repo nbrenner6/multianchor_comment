@@ -10,7 +10,7 @@ import org.junit.Test;
     name = "multianchor_comment",
     sysModule = "com.googlesource.gerrit.plugins.multianchorcomment.PluginModule"
 )
-public class MultiAnchorCommentIT extends LightweightPluginDaemonTest {
+public class MultianchorCommentIT extends LightweightPluginDaemonTest {
 
   @Test
   public void pluginLoads() throws Exception {

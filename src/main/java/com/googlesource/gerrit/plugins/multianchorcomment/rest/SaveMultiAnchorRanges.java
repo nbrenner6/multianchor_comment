@@ -14,11 +14,12 @@ import java.util.List;
 /**
  * REST endpoint for saving additional ranges for a comment.
  *
- * <p>PUT /changes/{changeId}/multianchor-ranges/{commentUuid}
+ * <p>PUT /changes/{changeId}/multianchor-ranges/{patchSet}~{commentUuid}
  *
- * <p>Saves the additional anchor ranges for the specified comment. These ranges are stored
- * separately from the primary range in Gerrit core, allowing comments to span multiple
- * non-contiguous code sections.
+ * <p>Saves the additional anchor ranges for the specified comment on the specified patchset.
+ * These ranges are stored separately from the primary range in Gerrit core, allowing comments
+ * to span multiple non-contiguous code sections. Ranges are scoped to a patchset so that line
+ * numbers correspond to the correct version of the file.
  *
  * <p>Example request body:
  *
@@ -93,6 +94,9 @@ public class SaveMultiAnchorRanges
     // Validate and convert all ranges
     List<Range> ranges = new ArrayList<>();
     for (RangeInput rangeInput : input.ranges) {
+      if (rangeInput == null) {
+        throw new BadRequestException("Null range element");
+      }
       if (!rangeInput.isValid()) {
         throw new BadRequestException(
             String.format(
@@ -106,7 +110,8 @@ public class SaveMultiAnchorRanges
       ranges.add(rangeInput.toRange());
     }
 
-    storage.saveRanges(rsrc.getProject(), rsrc.getChangeId(), rsrc.getCommentUuid(), ranges);
+    storage.saveRanges(
+        rsrc.getProject(), rsrc.getChangeId(), rsrc.getPatchSet(), rsrc.getCommentUuid(), ranges);
 
     return Response.ok(ranges);
   }

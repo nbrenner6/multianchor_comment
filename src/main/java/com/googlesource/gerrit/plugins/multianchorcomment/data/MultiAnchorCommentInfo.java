@@ -4,6 +4,7 @@ import com.google.gerrit.extensions.client.Comment.Range;
 import com.google.gerrit.extensions.common.CommentInfo;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Extended comment info that includes all anchor ranges.
@@ -44,9 +45,7 @@ public class MultiAnchorCommentInfo extends CommentInfo {
 
     // Initialize allRanges with the primary range
     result.allRanges = new ArrayList<>();
-    if (info.range != null) {
-      result.allRanges.add(info.range);
-    }
+    Optional.ofNullable(info.range).ifPresent(result.allRanges::add);
     result.isMultiAnchor = false;
 
     return result;
@@ -54,9 +53,14 @@ public class MultiAnchorCommentInfo extends CommentInfo {
 
   /** Adds additional ranges from plugin storage. */
   public void addAdditionalRanges(List<Range> additionalRanges) {
-    if (additionalRanges != null && !additionalRanges.isEmpty()) {
-      allRanges.addAll(additionalRanges);
-      isMultiAnchor = allRanges.size() > 1;
-    }
+    Optional.ofNullable(additionalRanges)
+        .filter(ranges -> !ranges.isEmpty())
+        .ifPresent(ranges -> {
+          if (allRanges == null) {
+            allRanges = new ArrayList<>();
+          }
+          allRanges.addAll(ranges);
+          isMultiAnchor = allRanges.size() > 1;
+        });
   }
 }

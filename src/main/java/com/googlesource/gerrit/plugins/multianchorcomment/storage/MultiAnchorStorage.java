@@ -37,18 +37,23 @@ import org.eclipse.jgit.treewalk.TreeWalk;
  *
  * <p>Stores additional anchor ranges in plugin-specific Git refs following NoteDb conventions.
  *
- * <p>Storage pattern mirrors Gerrit's draft comment storage:
+ * <p>Storage pattern mirrors Gerrit's draft comment storage with per-user scoping:
  *
  * <ul>
- *   <li>Ref: refs/meta/multianchor/{sharded-change-id} (e.g., refs/meta/multianchor/73/67473)
+ *   <li>Ref: refs/users/{sharded-account-id}/multianchor/{sharded-change-id} (e.g.,
+ *       refs/users/01/1000001/multianchor/73/67473)
  *   <li>Format: JSON blob in a Git tree, committed with user attribution
  *   <li>Data: Map of comment UUID → list of additional ranges
  * </ul>
+ *
+ * <p>Per-user scoping ensures that draft anchors are private to the user who created them,
+ * preventing one user from viewing or modifying another user's draft multi-anchor data.
  */
 @Singleton
 public class MultiAnchorStorage {
   private static final FluentLogger logger = FluentLogger.forEnclosingClass();
-  private static final String REFS_META_MULTIANCHOR = "refs/meta/multianchor/";
+  private static final String REFS_USERS = "refs/users/";
+  private static final String MULTIANCHOR_SUBDIR = "/multianchor/";
   private static final String DATA_FILE = "anchors.json";
 
   private final GitRepositoryManager repoManager;
@@ -64,14 +69,35 @@ public class MultiAnchorStorage {
   }
 
   /**
-   * Returns the sharded ref name for storing multi-anchor data.
+   * Returns the current user's account ID.
    *
-   * <p>Follows Gerrit's sharding convention: refs/meta/multianchor/{last-2-digits}/{full-id}
+   * @return the account ID of the current user
+   * @throws IllegalStateException if the current user is not identified
+   */
+  private int getCurrentAccountId() {
+    CurrentUser user = userProvider.get();
+    if (!user.isIdentifiedUser()) {
+      throw new IllegalStateException("Cannot access multi-anchor storage: user not identified");
+    }
+    return user.asIdentifiedUser().getAccountId().get();
+  }
+
+  /**
+   * Returns the user-scoped sharded ref name for storing multi-anchor data.
+   *
+   * <p>Follows Gerrit's sharding convention with per-user scoping:
+   * refs/users/{user-shard}/{user-id}/multianchor/{change-shard}/{change-id}
+   *
+   * <p>This ensures draft anchors are private to each user.
    */
   private String getRefName(Change.Id changeId) {
-    int id = changeId.get();
-    int shard = id % 100;
-    return String.format("%s%02d/%d", REFS_META_MULTIANCHOR, shard, id);
+    int accountId = getCurrentAccountId();
+    int accountShard = accountId % 100;
+    int changeIdNum = changeId.get();
+    int changeShard = changeIdNum % 100;
+    return String.format(
+        "%s%02d/%d%s%02d/%d",
+        REFS_USERS, accountShard, accountId, MULTIANCHOR_SUBDIR, changeShard, changeIdNum);
   }
 
   /**
@@ -284,27 +310,45 @@ public class MultiAnchorStorage {
   }
 
   /**
-   * Saves ranges for a specific comment.
+   * Builds the composite storage key for a comment on a specific patchset.
+   *
+   * @param patchSet the patchset number
+   * @param commentUuid the comment UUID
+   * @return the composite key in the format "{patchSet}/{commentUuid}"
+   */
+  private String storageKey(int patchSet, String commentUuid) {
+    return patchSet + "/" + commentUuid;
+  }
+
+  /**
+   * Saves ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number the ranges are scoped to
    * @param commentUuid the comment UUID
    * @param ranges the additional ranges (beyond the primary stored in core Gerrit)
    */
   public void saveRanges(
-      Project.NameKey project, Change.Id changeId, String commentUuid, List<Range> ranges)
+      Project.NameKey project,
+      Change.Id changeId,
+      int patchSet,
+      String commentUuid,
+      List<Range> ranges)
       throws IOException {
     MultiAnchorData data = load(project, changeId);
-    data.setRangesForComment(commentUuid, ranges);
+    data.setRangesForComment(storageKey(patchSet, commentUuid), ranges);
     save(project, changeId, data);
   }
 
   /**
    * Gets all additional ranges for a change.
    *
+   * <p>Returns composite keys in the format "{patchSet}/{commentUuid}".
+   *
    * @param project the project
    * @param changeId the change ID
-   * @return map of comment UUID to additional ranges
+   * @return map of composite key ({patchSet}/{commentUuid}) to additional ranges
    */
   public Map<String, List<Range>> getRanges(Project.NameKey project, Change.Id changeId)
       throws IOException {
@@ -312,30 +356,35 @@ public class MultiAnchorStorage {
   }
 
   /**
-   * Gets additional ranges for a specific comment.
+   * Gets additional ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number
    * @param commentUuid the comment UUID
    * @return list of additional ranges, or empty list if none
    */
   public List<Range> getRangesForComment(
-      Project.NameKey project, Change.Id changeId, String commentUuid) throws IOException {
-    return load(project, changeId).getRangesForComment(commentUuid);
+      Project.NameKey project, Change.Id changeId, int patchSet, String commentUuid)
+      throws IOException {
+    return load(project, changeId).getRangesForComment(storageKey(patchSet, commentUuid));
   }
 
   /**
-   * Deletes ranges for a specific comment.
+   * Deletes ranges for a specific comment on a specific patchset.
    *
    * @param project the project
    * @param changeId the change ID
+   * @param patchSet the patchset number
    * @param commentUuid the comment UUID
    */
-  public void deleteRanges(Project.NameKey project, Change.Id changeId, String commentUuid)
+  public void deleteRanges(
+      Project.NameKey project, Change.Id changeId, int patchSet, String commentUuid)
       throws IOException {
+    String key = storageKey(patchSet, commentUuid);
     MultiAnchorData data = load(project, changeId);
-    if (data.hasRangesForComment(commentUuid)) {
-      data.removeComment(commentUuid);
+    if (data.hasRangesForComment(key)) {
+      data.removeComment(key);
       save(project, changeId, data);
     }
   }

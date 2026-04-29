@@ -13,7 +13,7 @@ import java.util.List;
 /**
  * REST endpoint for getting additional ranges for a specific comment.
  *
- * <p>GET /changes/{changeId}/multianchor-ranges/{commentUuid}
+ * <p>GET /changes/{changeId}/multianchor-ranges/{patchSet}~{commentUuid}
  *
  * <p>Returns the list of additional ranges for the specified comment. These are ranges beyond the
  * primary range stored in Gerrit core.
@@ -42,7 +42,8 @@ public class GetMultiAnchorRanges implements RestReadView<MultiAnchorRangesResou
   @Override
   public Response<List<Range>> apply(MultiAnchorRangesResource rsrc) throws IOException {
     List<Range> ranges =
-        storage.getRangesForComment(rsrc.getProject(), rsrc.getChangeId(), rsrc.getCommentUuid());
+        storage.getRangesForComment(
+            rsrc.getProject(), rsrc.getChangeId(), rsrc.getPatchSet(), rsrc.getCommentUuid());
     return Response.ok(ranges);
   }
 }

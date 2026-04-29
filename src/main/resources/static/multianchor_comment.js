@@ -31,6 +31,40 @@ Gerrit.install(plugin => {
     return m ? decodeURIComponent(m[1]) : null;
   }
 
+  // ── Effective patchset resolution ──────────────────────────────────────────
+  /**
+   * Cache so we do not refetch change detail on every operation while the URL
+   * still implies "current".
+   */
+  let effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
+
+  /**
+   * Returns the numeric patchset string to use for APIs and storage keys.
+   * When the URL omits a revision, Gerrit uses "current" for draft endpoints,
+   * but plugin storage keys need numeric patchset numbers; this resolves
+   * "current" via change detail.
+   * @param {string} changeNum
+   * @returns {Promise<string>}
+   */
+  async function getEffectivePatchSetNumber(changeNum) {
+    const urlToken = getPatchSetNumber();
+    if (urlToken !== 'current') {
+      return urlToken;
+    }
+    if (
+      effectivePatchSetCache.changeNum === changeNum &&
+      effectivePatchSetCache.urlToken === urlToken &&
+      effectivePatchSetCache.resolved != null
+    ) {
+      return effectivePatchSetCache.resolved;
+    }
+    const detail = await restApi.get(`/changes/${changeNum}/detail`);
+    const rev = detail.revisions[detail.current_revision];
+    const resolved = String(rev._number);
+    effectivePatchSetCache = { changeNum, urlToken, resolved };
+    return resolved;
+  }
+
   // ── Prompt history (localStorage) ─────────────────────────────────────────
   const HISTORY_KEY = 'ma-plugin:prompt-history';
   const MAX_HISTORY = 5;
@@ -315,9 +349,14 @@ Gerrit.install(plugin => {
   }
 
   // ── Create / delete multi-anchor comments ─────────────────────────────────
+  /**
+   * Creates a multi-anchor comment (draft + additional ranges).
+   * Implements compensation logic for atomicity: if saveAdditionalRanges fails,
+   * the draft is deleted to avoid inconsistent state.
+   */
   async function createMultiAnchorComment(selectedLines, message, resolved) {
     const changeNum = getChangeNumber();
-    const patchSet  = getPatchSetNumber();
+    const patchSet  = await getEffectivePatchSetNumber(changeNum);
     if (!changeNum) return null;
 
     // Determine dominant side among selected anchors
@@ -337,11 +376,29 @@ Gerrit.install(plugin => {
     const allRanges = anchorKeysToRanges(selectedLines, side);
     if (!allRanges.length) return null;
 
+    let draft = null;
     try {
-      const draft = await createDraft(changeNum, patchSet, path, allRanges[0], message, !resolved);
+      // 1. Create draft with primary (first) range via Gerrit API
+      draft = await createDraft(changeNum, patchSet, path, allRanges[0], message, !resolved);
+
+      // 2. If there are additional ranges, save them via plugin API
       if (allRanges.length > 1) {
-        await saveAdditionalRanges(changeNum, draft.id, allRanges.slice(1));
+        const additionalRanges = allRanges.slice(1);
+        try {
+          await saveAdditionalRanges(changeNum, draft.id, additionalRanges);
+        } catch (rangeError) {
+          // Compensation: delete the draft to maintain consistency
+          console.error('Failed to save additional ranges, compensating by deleting draft:', rangeError);
+          try {
+            await deleteDraft(changeNum, patchSet, draft.id);
+          } catch (deleteError) {
+            console.error('Compensation delete failed:', deleteError);
+          }
+          throw rangeError;
+        }
       }
+
+      // 3. Add to local cache
       savedComments.set(draft.id, {
         id:               draft.id,
         path,
@@ -353,19 +410,58 @@ Gerrit.install(plugin => {
         additionalRanges: allRanges.slice(1),
       });
       return draft;
-    } catch { return null; }
+    } catch (error) {
+      console.error('Failed to create multi-anchor comment:', error);
+      return null;
+    }
   }
 
+  /**
+   * Deletes a multi-anchor comment (draft + additional ranges).
+   * Implements retry logic for atomicity: if deleteAdditionalRanges fails,
+   * retries with backoff and logs the partial failure.
+   */
   async function deleteMultiAnchorComment(commentId) {
     const changeNum = getChangeNumber();
-    const patchSet  = getPatchSetNumber();
+    const patchSet  = await getEffectivePatchSetNumber(changeNum);
     if (!changeNum) return false;
+
     try {
+      // 1. Delete draft from Gerrit first
       await deleteDraft(changeNum, patchSet, commentId);
-      await deleteAdditionalRanges(changeNum, commentId);
+
+      // 2. Delete additional ranges from plugin storage with retry
+      let rangeDeleteSuccess = false;
+      let lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await deleteAdditionalRanges(changeNum, commentId);
+          rangeDeleteSuccess = true;
+          break;
+        } catch (rangeError) {
+          lastError = rangeError;
+          console.warn(`Attempt ${attempt + 1} to delete additional ranges failed:`, rangeError);
+          if (attempt < 2) {
+            // Exponential backoff: 100ms, 200ms
+            await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+          }
+        }
+      }
+
+      if (!rangeDeleteSuccess) {
+        // Log partial failure — draft deleted but ranges remain (orphaned).
+        // Still treat as success for the user since the draft is gone; the
+        // orphaned range data is harmless (references a non-existent comment).
+        console.error('Partial delete: draft deleted but additional ranges remain:', lastError);
+      }
+
+      // 3. Remove from local cache
       savedComments.delete(commentId);
       return true;
-    } catch { return false; }
+    } catch (error) {
+      console.error('Failed to delete multi-anchor comment:', error);
+      return false;
+    }
   }
 
   // ── Global styles ─────────────────────────────────────────────────────────
@@ -1375,6 +1471,9 @@ Gerrit.install(plugin => {
     // swaps the diff element during file navigation.
     if (!attachPollInstalled) {
       attachPollInstalled = true;
+      // Reset the effective patchset cache on each new attach cycle so that
+      // navigation to a different change or patchset picks up fresh data.
+      effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
       setInterval(attachListeners, 700);
     }
 
