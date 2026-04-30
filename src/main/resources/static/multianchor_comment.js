@@ -51,7 +51,6 @@ Gerrit.install(plugin => {
         event,
         data,
       };
-      // Console output: easy to grep with "[MA]" in DevTools
       console.log(`[MA] [${category.toUpperCase()}] ${event}`, data);
       _persist(entry);
       return entry;
@@ -59,38 +58,17 @@ Gerrit.install(plugin => {
 
     return {
       sessionId: SESSION_ID,
-
-      // ── Session events ─────────────────────────────────────────────────
       session(event, data)  { return _emit('session',  event, data); },
-
-      // ── Anchor-selection events ────────────────────────────────────────
       anchor(event, data)   { return _emit('anchor',   event, data); },
-
-      // ── Comment lifecycle events ───────────────────────────────────────
       comment(event, data)  { return _emit('comment',  event, data); },
-
-      // ── AI-review events ───────────────────────────────────────────────
       ai(event, data)       { return _emit('ai',       event, data); },
-
-      // ── UI / navigation events ─────────────────────────────────────────
       ui(event, data)       { return _emit('ui',       event, data); },
-
-      // ── Error events ───────────────────────────────────────────────────
       error(event, data)    { return _emit('error',    event, data); },
-
-      /**
-       * Returns a copy of the full log array from sessionStorage.
-       * Useful for exporting during/after a test session.
-       */
       export() {
         try {
           return JSON.parse(sessionStorage.getItem(SESSION_KEY) || '[]');
         } catch { return []; }
       },
-
-      /**
-       * Clears the persisted log (e.g. between test runs).
-       */
       clear() {
         sessionStorage.removeItem(SESSION_KEY);
         console.log('[MA] Log cleared.');
@@ -98,7 +76,6 @@ Gerrit.install(plugin => {
     };
   })();
 
-  // Expose on window so testers can call MALog.export() / MALog.clear() in DevTools
   window.MALog = MALog;
 
   MALog.session('plugin_init', {
@@ -111,7 +88,9 @@ Gerrit.install(plugin => {
 
   // ── In-memory store ────────────────────────────────────────────────────────
   const savedComments = new Map();
-  const managedGerritIds = new Set(); // raw Gerrit draft IDs, e.g. "30cf37cd_63ac1f2c"
+  const managedGerritIds = new Set();
+  let activeEditState = null;
+  let editingCommentId = null;
 
   // ── URL helpers ────────────────────────────────────────────────────────────
   function getChangeNumber() {
@@ -127,37 +106,54 @@ Gerrit.install(plugin => {
     return m ? decodeURIComponent(m[1]) : null;
   }
   function toPluginUrlId(rawGerritId, patchSet) {
-    // rawGerritId is the full Gerrit draft ID, e.g. "57c51203_e734edd9"
-    // The backend splits on '~' to get patchSet and commentUuid
     return `${patchSet}~${rawGerritId}`;
   }
-
-  // Storage key for looking up in getAllAdditionalRanges response: {patchSet}/{rawGerritDraftId}
   function toPluginStorageKey(rawGerritId, patchSet) {
     if (!rawGerritId) return rawGerritId;
     return `${patchSet}/${rawGerritId}`;
   }
-
   function toGerritDraftId(storageKey) {
-    // Storage key is "1/57c51203_e734edd9" — Gerrit wants "57c51203_e734edd9"
     return storageKey.includes('/') ? storageKey.split('/').slice(1).join('/') : storageKey;
   }
 
+  function snapshotActiveEditState() {
+    let openEdit = null;
+    walkShadowTree(document.body, node => {
+      if (openEdit || node.nodeType !== 1 || !node.matches) return;
+      if (node.matches('.ma-card-edit') && node.style.display === 'block') {
+        openEdit = node;
+      }
+    });
+    if (!openEdit) {
+      activeEditState = null;
+      return;
+    }
+    const thread = openEdit.closest('tr.multi-anchor-thread');
+    const textarea = openEdit.querySelector('.ma-edit-textarea');
+    if (!thread || !textarea) return;
+    activeEditState = {
+      commentId: thread.dataset.commentId,
+      text: textarea.value,
+    };
+  }
+
+  function isEditSessionActive() {
+    if (editingCommentId) return true;
+    if (!activeEditState?.commentId) return false;
+    let found = false;
+    walkShadowTree(document.body, node => {
+      if (found || node.nodeType !== 1 || !node.matches) return;
+      if (!node.matches('tr.multi-anchor-thread')) return;
+      if (node.dataset.commentId !== activeEditState.commentId) return;
+      const editArea = node.querySelector('.ma-card-edit');
+      if (editArea?.style?.display === 'block') found = true;
+    });
+    return found;
+  }
+
   // ── Effective patchset resolution ──────────────────────────────────────────
-  /**
-   * Cache so we do not refetch change detail on every operation while the URL
-   * still implies "current".
-   */
   let effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
 
-  /**
-   * Returns the numeric patchset string to use for APIs and storage keys.
-   * When the URL omits a revision, Gerrit uses "current" for draft endpoints,
-   * but plugin storage keys need numeric patchset numbers; this resolves
-   * "current" via change detail.
-   * @param {string} changeNum
-   * @returns {Promise<string>}
-   */
   async function getEffectivePatchSetNumber(changeNum) {
     const urlToken = getPatchSetNumber();
     if (urlToken !== 'current') {
@@ -182,7 +178,7 @@ Gerrit.install(plugin => {
         changeNum,
         error: e?.message || String(e),
       });
-      return 'current'; // Gerrit draft endpoints accept "current" as a fallback
+      return 'current';
     }
   }
 
@@ -197,20 +193,10 @@ Gerrit.install(plugin => {
   }
 
   // ── Multi-file anchor key helpers ──────────────────────────────────────────
-  /**
-   * @param {string} filePath - repo path for this diff (from gr-diff-host)
-   * @param {"left" | "right"} side
-   * @param {string} lineNum
-   * @returns {string}
-   */
   function makeAnchorKey(filePath, side, lineNum) {
     return JSON.stringify({ p: filePath, s: side, n: String(lineNum) });
   }
 
-  /**
-   * @param {string} key
-   * @returns {{ path: string, side: string, lineNum: string } | null}
-   */
   function parseAnchorKey(key) {
     try {
       const o = JSON.parse(key);
@@ -221,10 +207,6 @@ Gerrit.install(plugin => {
     return null;
   }
 
-  /**
-   * @param {string} key
-   * @returns {string}
-   */
   function formatAnchorLabel(key) {
     const a = parseAnchorKey(key);
     if (!a) return key;
@@ -233,11 +215,6 @@ Gerrit.install(plugin => {
     return a.path ? `${base}:${lr}${a.lineNum}` : `${lr}${a.lineNum}`;
   }
 
-  /**
-   * Formats anchors as grouped-by-file labels, e.g. "foo.js: R2, R4; bar.js: L10".
-   * @param {string[]} keys
-   * @returns {string}
-   */
   function formatGroupedAnchorLabels(keys) {
     const byPath = new Map();
     keys.forEach(key => {
@@ -276,16 +253,11 @@ Gerrit.install(plugin => {
     } catch { return null; }
   }
 
-  /**
-   * Walks composed ancestors and shadow hosts to find gr-diff-host (holds .path).
-   * @param {Node | null} node
-   * @returns {HTMLElement | null}
-   */
   function getGrDiffHostFromNode(node) {
     let n = node;
     while (n) {
       if (n.nodeType === 1 && n.tagName === 'GR-DIFF-HOST') {
-        return /** @type {HTMLElement} */ (n);
+        return n;
       }
       const root = n.getRootNode();
       if (root && root.host) {
@@ -297,20 +269,12 @@ Gerrit.install(plugin => {
     return null;
   }
 
-  /**
-   * @param {Node | null} node
-   * @returns {string}
-   */
   function getFilePathForDiffContext(node) {
     const host = getGrDiffHostFromNode(node);
     if (!host) return '';
     return host.path || host.getAttribute?.('path') || '';
   }
 
-  /**
-   * @param {HTMLElement | null} diffElement - gr-diff-element
-   * @returns {{ table: HTMLTableElement | null, filePath: string }}
-   */
   function getTablePathPair(diffElement) {
     if (!diffElement) return { table: null, filePath: '' };
     const table =
@@ -320,12 +284,6 @@ Gerrit.install(plugin => {
     return { table, filePath };
   }
 
-  /**
-   * Last anchor in insertion order that belongs to currentPath (for draft placement).
-   * @param {string[]} keys
-   * @param {string} currentPath
-   * @returns {string | null}
-   */
   function getLastAnchorKeyForFile(keys, currentPath) {
     for (let i = keys.length - 1; i >= 0; i--) {
       const a = parseAnchorKey(keys[i]);
@@ -334,11 +292,6 @@ Gerrit.install(plugin => {
     return null;
   }
 
-  /**
-   * @param {HTMLTableElement} table
-   * @param {{ path: string, side: string, lineNum: string } | null} anchor
-   * @returns {HTMLTableRowElement | null}
-   */
   function findRowForAnchor(table, anchor) {
     if (!table || !anchor) return null;
     return table.querySelector(`td.${anchor.side}.lineNum[data-value="${anchor.lineNum}"]`)?.closest('tr') || null;
@@ -382,20 +335,11 @@ Gerrit.install(plugin => {
   async function deleteAdditionalRanges(changeNum, urlId) {
     return restApi.delete(`/changes/${changeNum}/multianchor-ranges/${urlId}`);
   }
-
   async function getAllAdditionalRanges(changeNum) {
     return restApi.get(`/changes/${changeNum}/multianchor-ranges`);
   }
 
   // ── Convert anchor keys to/from REST range objects ─────────────────────────
-  /**
-   * Converts a Set of anchor keys (JSON with path/side/lineNum) into REST range
-   * objects grouped by side, for use in createDraft / saveAdditionalRanges.
-   * Only lines matching `side` are included.
-   * @param {Set<string>} lineKeys
-   * @param {"left"|"right"} side
-   * @returns {{ start_line: number, start_character: number, end_line: number, end_character: number }[]}
-   */
   function anchorKeysToRanges(lineKeys, side) {
     const nums = [...lineKeys]
       .map(k => parseAnchorKey(k))
@@ -437,7 +381,7 @@ Gerrit.install(plugin => {
 
       for (let [path, comments] of Object.entries(drafts || {})) {
         path = path.replace(/^\[(.+?)\]\(.+?\)$/, '$1');
-         for (const comment of comments) {
+        for (const comment of comments) {
           const storageKey = toPluginStorageKey(comment.id, patchSet);
           const extraRanges = additionalRanges[storageKey] || [];
           const isAiComment = comment.message?.startsWith(AI_PREFIX);
@@ -450,8 +394,6 @@ Gerrit.install(plugin => {
               : null);
           const allRanges = primaryRange ? [primaryRange, ...extraRanges] : extraRanges;
 
-          // Convert REST ranges → multifile anchor keys so the rest of the
-          // plugin can treat backend-loaded comments the same as locally-created ones.
           const lines = allRanges.flatMap(r => {
             const start = r.start_line ?? r.startLine;
             const end   = r.end_line   ?? r.endLine;
@@ -466,6 +408,7 @@ Gerrit.install(plugin => {
           savedComments.set(storageKey, {
             id: storageKey,
             path,
+            patchSet,
             lines,
             text: comment.message,
             resolved: comment.unresolved === false,
@@ -506,17 +449,11 @@ Gerrit.install(plugin => {
   }
 
   // ── Create / delete multi-anchor comments ─────────────────────────────────
-  /**
-   * Creates a multi-anchor comment (draft + additional ranges).
-   * Implements compensation logic for atomicity: if saveAdditionalRanges fails,
-   * the draft is deleted to avoid inconsistent state.
-   */
   async function createMultiAnchorComment(selectedLines, message, resolved) {
     const changeNum = getChangeNumber();
     const patchSet  = await getEffectivePatchSetNumber(changeNum);
     if (!changeNum) return null;
 
-    // Determine dominant side among selected anchors
     let rightCount = 0, leftCount = 0;
     selectedLines.forEach(k => {
       const a = parseAnchorKey(k);
@@ -525,7 +462,6 @@ Gerrit.install(plugin => {
     });
     const side = rightCount >= leftCount ? 'right' : 'left';
 
-    // Derive the file path from the first anchor (primary draft must have a path)
     const firstAnchor = parseAnchorKey([...selectedLines][0]);
     const path = firstAnchor?.path || getFilePath();
     if (!path) return null;
@@ -533,7 +469,6 @@ Gerrit.install(plugin => {
     const allRanges = anchorKeysToRanges(selectedLines, side);
     if (!allRanges.length) return null;
 
-    // Compute per-file anchor breakdown for logging
     const anchorsByFile = {};
     selectedLines.forEach(k => {
       const a = parseAnchorKey(k);
@@ -561,18 +496,15 @@ Gerrit.install(plugin => {
     let draft = null;
     let fullDraftId = null;
     try {
-      // 1. Create draft with primary (first) range via Gerrit API
       draft = await createDraft(changeNum, patchSet, path, allRanges[0], message, !resolved);
 
       fullDraftId = toPluginStorageKey(draft.id, patchSet);
       const urlId = toPluginUrlId(draft.id, patchSet);
 
-      // 2. If there are additional ranges, save them via plugin API
       const additionalRanges = allRanges.slice(1);
       try {
         await saveAdditionalRanges(changeNum, urlId, additionalRanges);
       } catch (rangeError) {
-        // Compensation: delete the draft to maintain consistency
         console.error('Failed to save additional ranges, compensating by deleting draft:', rangeError);
         MALog.error('create_additional_ranges_failed', {
           commentId: draft.id,
@@ -593,10 +525,10 @@ Gerrit.install(plugin => {
         throw rangeError;
       }
 
-      // 3. Add to local cache
       savedComments.set(fullDraftId, {
         id:               fullDraftId,
         path,
+        patchSet,
         lines:            [...selectedLines],
         text:             message,
         resolved,
@@ -607,7 +539,7 @@ Gerrit.install(plugin => {
 
       managedGerritIds.add(draft.id);
 
-      lastLoadTs = Date.now(); // suppress poll reload until backend is consistent
+      lastLoadTs = Date.now();
 
       MALog.comment('create_success', {
         commentId:      draft.id,
@@ -625,30 +557,28 @@ Gerrit.install(plugin => {
         anchorsByFile,
       });
 
-     return { draft, error: null };
-      } catch (error) {
-        console.error('[MA] createMultiAnchorComment failed:', error);
-        MALog.error('create_failed', {
-          changeNum,
-          patchSet,
-          primaryPath: path,
-          error: error?.message || String(error),
-        });
-        return { draft: null, error };
-      }
+      return { draft, error: null };
+    } catch (error) {
+      console.error('[MA] createMultiAnchorComment failed:', error);
+      MALog.error('create_failed', {
+        changeNum,
+        patchSet,
+        primaryPath: path,
+        error: error?.message || String(error),
+      });
+      return { draft: null, error };
+    }
   }
 
-  /**
-   * Deletes a multi-anchor comment (draft + additional ranges).
-   * Implements retry logic for atomicity: if deleteAdditionalRanges fails,
-   * retries with backoff and logs the partial failure.
-   */
   async function deleteMultiAnchorComment(commentId) {
     const changeNum = getChangeNumber();
-    const patchSet  = await getEffectivePatchSetNumber(changeNum);
+    const commentMeta = savedComments.get(commentId);
+    const patchSet =
+      commentMeta?.patchSet != null
+        ? String(commentMeta.patchSet)
+        : await getEffectivePatchSetNumber(changeNum);
     if (!changeNum) return false;
 
-    const commentMeta = savedComments.get(commentId);
     MALog.comment('delete_start', {
       commentId,
       changeNum,
@@ -659,14 +589,12 @@ Gerrit.install(plugin => {
     });
 
     try {
-      // 1. Delete draft from Gerrit first
       const rawGerritId = commentId.includes('/') ? commentId.split('/').slice(1).join('/') : commentId;
       const urlId = toPluginUrlId(rawGerritId, patchSet);
-      const gerritId = rawGerritId; // Gerrit draft endpoint wants the raw ID as-is
+      const gerritId = rawGerritId;
 
       await deleteDraft(changeNum, patchSet, gerritId);
 
-      // 2. Delete additional ranges from plugin storage with retry
       let rangeDeleteSuccess = false;
       let lastError = null;
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -678,16 +606,12 @@ Gerrit.install(plugin => {
           lastError = rangeError;
           console.warn(`Attempt ${attempt + 1} to delete additional ranges failed:`, rangeError);
           if (attempt < 2) {
-            // Exponential backoff: 100ms, 200ms
             await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
           }
         }
       }
 
       if (!rangeDeleteSuccess) {
-        // Log partial failure — draft deleted but ranges remain (orphaned).
-        // Still treat as success for the user since the draft is gone; the
-        // orphaned range data is harmless (references a non-existent comment).
         console.error('Partial delete: draft deleted but additional ranges remain:', lastError);
         MALog.error('delete_partial_ranges_orphaned', {
           commentId,
@@ -697,7 +621,6 @@ Gerrit.install(plugin => {
         });
       }
 
-      // 3. Remove from local cache
       savedComments.delete(commentId);
       managedGerritIds.delete(toGerritDraftId(commentId));
 
@@ -814,9 +737,8 @@ Gerrit.install(plugin => {
         border-bottom: 1px solid rgba(0,0,0,.07);
       }
 
-      /* Edit area */
+      /* Edit area — hidden by default via inline style, not CSS class */
       .ma-card-edit {
-        display: none;
         padding: var(--spacing-m);
         border-bottom: 1px solid rgba(0,0,0,.07);
       }
@@ -842,6 +764,9 @@ Gerrit.install(plugin => {
         justify-content: flex-end;
         gap: var(--spacing-s);
         margin-top: var(--spacing-s);
+        position: relative;
+        z-index: 3;
+        pointer-events: auto;
       }
 
       /* Footer */
@@ -913,7 +838,6 @@ Gerrit.install(plugin => {
     if (document.getElementById('ma-ai-fab-wrapper')) return;
     if (document.getElementById('ma-ai-fab')) return;
 
-    // FAB
     const fabWrapper = document.createElement('div');
     fabWrapper.id = 'ma-ai-fab-wrapper';
     Object.assign(fabWrapper.style, {
@@ -950,7 +874,6 @@ Gerrit.install(plugin => {
     document.documentElement.appendChild(fabWrapper);
     fabEl = fab;
 
-    // Panel
     const panel = document.createElement('div');
     panel.id = 'ma-ai-panel';
     Object.assign(panel.style, {
@@ -1170,7 +1093,6 @@ Gerrit.install(plugin => {
       padding: '1px 5px', lineHeight: '1.4', pointerEvents: 'none',
     });
     badge.textContent = n;
-    // ← removed wrapper.style.position = 'relative'
     wrapper.appendChild(badge);
   }
 
@@ -1197,7 +1119,9 @@ Gerrit.install(plugin => {
     injectHiderStyle(root);
 
     const hideAll = () => {
-      root.querySelectorAll('gr-comment-thread').forEach(el => {
+      walkShadowTree(root, treeNode => {
+        if (treeNode.nodeType !== 1 || !treeNode.querySelectorAll) return;
+        treeNode.querySelectorAll('gr-comment-thread').forEach(el => {
         try {
           if (el.dataset.maHidden) return;
           let shouldHide = false;
@@ -1206,7 +1130,6 @@ Gerrit.install(plugin => {
           if (thread) {
             const rawId   = thread.rootId || thread.comments?.[0]?.id || '';
             const firstMsg = thread.comments?.[0]?.message || '';
-            // Match by raw Gerrit ID (no patchset prefix) or AI prefix
             shouldHide = managedGerritIds.has(rawId) || firstMsg.startsWith(AI_PREFIX);
           }
           if (!shouldHide && (el.innerText || '').includes('🤖 AI Review:')) shouldHide = true;
@@ -1219,6 +1142,7 @@ Gerrit.install(plugin => {
             if (tr) tr.style.display = 'none';
           }
         } catch { /* element mid-upgrade */ }
+      });
       });
     };
 
@@ -1233,8 +1157,8 @@ Gerrit.install(plugin => {
     let pollCount = 0;
     hidePoller = setInterval(() => {
       hideAll();
-      if (++pollCount >= 80) clearInterval(hidePoller);
-    }, 100);
+      if (++pollCount >= 180) clearInterval(hidePoller);
+    }, 50);
   }
 
   function injectHiderStyle(shadowRoot) {
@@ -1255,13 +1179,6 @@ Gerrit.install(plugin => {
     return d.innerHTML;
   }
 
-  /**
-   * Marks lines associated with a multi-anchor comment in the visible table.
-   * Only anchors belonging to filePath are marked (multi-file safe).
-   * @param {HTMLTableElement} table
-   * @param {string} filePath
-   * @param {string[]} lines - anchor keys
-   */
   function markAnchoredLines(table, filePath, lines) {
     lines.forEach(lineKey => {
       const a = parseAnchorKey(lineKey);
@@ -1274,7 +1191,6 @@ Gerrit.install(plugin => {
   }
 
   function addRangeBadge(table, filePath, lines) {
-    // Find first anchor visible in this file for badge placement
     let firstKey = null;
     for (const k of lines) {
       const a = parseAnchorKey(k);
@@ -1305,9 +1221,6 @@ Gerrit.install(plugin => {
   }
 
   // ── Pending selection helpers ──────────────────────────────────────────────
-  /**
-   * @returns {{ anchorCount: number, fileCount: number }}
-   */
   function getPendingAnchorStats() {
     const files = new Set();
     selectedLines.forEach(key => {
@@ -1317,10 +1230,6 @@ Gerrit.install(plugin => {
     return { anchorCount: selectedLines.size, fileCount: files.size };
   }
 
-  /**
-   * @param {string} filePath
-   * @returns {boolean}
-   */
   function hasPendingAnchorsForFile(filePath) {
     for (const key of selectedLines) {
       const a = parseAnchorKey(key);
@@ -1329,12 +1238,6 @@ Gerrit.install(plugin => {
     return false;
   }
 
-  /**
-   * Re-applies yellow selection styling to lines visible in this table.
-   * @param {HTMLTableElement} table
-   * @param {string} filePath
-   * @returns {number} number of anchors re-highlighted
-   */
   function applyPendingSelectionToTable(table, filePath) {
     if (!table || !filePath) return 0;
     let count = 0;
@@ -1364,16 +1267,30 @@ Gerrit.install(plugin => {
   /**
    * Renders all saved comment threads that touch filePath into the diff table.
    * Multi-file comments appear once per file (under the last anchor in that file).
-   * Uses the ai_review card style for all comments.
+   *
+   * FIX: Edit area is hidden via inline style (not CSS class) so JS can reliably
+   * toggle it. Textarea value is set via .value (not innerHTML) to avoid double-
+   * escaping. Resolved checkbox save no longer triggers a full re-render that
+   * would destroy open edit state.
+   *
+   * FIX: Row insertion falls back to table.appendChild() when no anchor row is
+   * found, keeping the row inside the table element.
    *
    * @param {HTMLTableElement} table
    * @param {string} filePath
    */
-  function displaySavedComments(table, filePath) {
+  function displaySavedComments(table, filePath, options = {}) {
+    const { preserveOpenEdit = true } = options;
     const diffElement = getDiffElement();
     if (diffElement) ensureStylesInjected(diffElement);
 
     // Clear existing plugin rows and markers
+    if (preserveOpenEdit) {
+      snapshotActiveEditState();
+    } else {
+      activeEditState = null;
+      editingCommentId = null;
+    }
     table.querySelectorAll('.multi-anchor-thread').forEach(el => el.remove());
     table.querySelectorAll('td.multi-anchor-existing, td.multi-anchor-highlighted').forEach(td => {
       td.classList.remove('multi-anchor-existing', 'multi-anchor-highlighted');
@@ -1383,7 +1300,6 @@ Gerrit.install(plugin => {
     savedComments.forEach((comment, commentId) => {
       const { lines, text, resolved } = comment;
 
-      // Only render if this comment has at least one anchor in the current file
       const hasAnchorHere = lines.some(lk => parseAnchorKey(lk)?.path === filePath);
       if (!hasAnchorHere) return;
 
@@ -1393,12 +1309,15 @@ Gerrit.install(plugin => {
       addRangeBadge(table, filePath, lines);
 
       const lineLabel = formatGroupedAnchorLabels(lines);
+      // Strip the AI prefix for display; keep raw text for edit textarea
       const displayText = isAi ? text.replace(/^🤖 AI Review:\n\n/, '') : text;
 
       const tr = document.createElement('tr');
       tr.className = 'multi-anchor-thread';
       tr.dataset.commentId = commentId;
 
+      // Build card HTML — edit area starts hidden via inline style, NOT a CSS
+      // display:none rule, so JS can reliably override it without specificity fights.
       tr.innerHTML = `
         <td colspan="3"></td>
         <td style="padding:0; border-top:1px solid var(--border-color); overflow:hidden;">
@@ -1414,11 +1333,11 @@ Gerrit.install(plugin => {
 
             <div class="ma-card-body">${escHtml(displayText)}</div>
 
-            <div class="ma-card-edit">
-              <textarea class="ma-edit-textarea">${escHtml(displayText)}</textarea>
+            <div class="ma-card-edit" style="display:none;">
+              <textarea class="ma-edit-textarea" rows="5"></textarea>
               <div class="ma-card-edit-actions">
-                <button class="ma-btn muted ma-edit-cancel">Cancel</button>
-                <button class="ma-btn ma-edit-save">Save draft</button>
+                <button type="button" class="ma-btn muted ma-edit-cancel">Cancel</button>
+                <button type="button" class="ma-btn ma-edit-save">Save draft</button>
               </div>
             </div>
 
@@ -1428,8 +1347,8 @@ Gerrit.install(plugin => {
                 Resolved
               </label>
               <div class="ma-card-actions">
-                <button class="ma-btn ma-edit-btn">Edit</button>
-                <button class="ma-btn danger ma-discard-btn">Discard</button>
+                <button type="button" class="ma-btn ma-edit-btn">Edit</button>
+                <button type="button" class="ma-btn danger ma-discard-btn">Discard</button>
               </div>
             </div>
 
@@ -1441,8 +1360,26 @@ Gerrit.install(plugin => {
       const card     = tr.querySelector('.ma-card');
       const body     = tr.querySelector('.ma-card-body');
       const editArea = tr.querySelector('.ma-card-edit');
+      editArea.addEventListener('click', ev => ev.stopPropagation());
+      editArea.addEventListener('mousedown', ev => ev.stopPropagation());
+      editArea.addEventListener('pointerdown', ev => ev.stopPropagation());
+      // FIX: set textarea value via .value, not innerHTML, to avoid double-escaping
       const textarea = tr.querySelector('.ma-edit-textarea');
+      const isEditingThisComment = activeEditState?.commentId === commentId;
+      textarea.value = isEditingThisComment ? activeEditState.text : displayText;
+      if (isEditingThisComment) {
+        body.style.display = 'none';
+        editArea.style.display = 'block';
+      }
+      textarea.addEventListener('input', () => {
+        if (activeEditState?.commentId === commentId) {
+          activeEditState.text = textarea.value;
+        }
+      });
 
+      // ── Resolve checkbox ───────────────────────────────────────────────
+      // FIX: update in-memory state and DOM only — no full re-render — so an
+      // open edit panel isn't destroyed when the checkbox is toggled.
       tr.querySelector('.ma-resolve-checkbox').addEventListener('change', async ev => {
         ev.stopPropagation();
         const newResolved = ev.target.checked;
@@ -1453,24 +1390,29 @@ Gerrit.install(plugin => {
           path: filePath,
         });
         comment.resolved = newResolved;
-        card.classList.toggle('resolved', comment.resolved);
+        card.classList.toggle('resolved', newResolved);
         try {
           const changeNum = getChangeNumber();
-          const patchSet = await getEffectivePatchSetNumber(changeNum);
-          await updateDraft(changeNum, patchSet, toGerritDraftId(commentId),
-            isAi ? AI_PREFIX + '\n\n' + displayText : displayText,
-            !comment.resolved
-          );
+          const patchSet =
+            comment.patchSet != null
+              ? String(comment.patchSet)
+              : await getEffectivePatchSetNumber(changeNum);
+          const storageText = isAi ? AI_PREFIX + '\n\n' + displayText : displayText;
+          await updateDraft(changeNum, patchSet, toGerritDraftId(commentId), storageText, !newResolved);
           MALog.comment('resolve_saved', { commentId, resolved: newResolved });
         } catch (err) {
+          // Roll back the checkbox on failure
+          ev.target.checked = !newResolved;
+          comment.resolved = !newResolved;
+          card.classList.toggle('resolved', !newResolved);
           MALog.error('resolve_save_failed', {
             commentId,
             error: err?.message || String(err),
           });
         }
-        displaySavedComments(table, filePath);
       });
 
+      // ── Edit button ────────────────────────────────────────────────────
       tr.querySelector('.ma-edit-btn').addEventListener('click', ev => {
         ev.stopPropagation();
         MALog.comment('edit_opened', {
@@ -1479,25 +1421,46 @@ Gerrit.install(plugin => {
           path: filePath,
           currentLength: displayText.length,
         });
+        editingCommentId = commentId;
+        activeEditState = { commentId, text: textarea.value };
         body.style.display     = 'none';
         editArea.style.display = 'block';
         textarea.focus();
         textarea.setSelectionRange(textarea.value.length, textarea.value.length);
       });
 
+      // ── Edit cancel ────────────────────────────────────────────────────
       tr.querySelector('.ma-edit-cancel').addEventListener('click', ev => {
         ev.stopPropagation();
         MALog.comment('edit_cancelled', { commentId, isAi });
+        // Restore textarea to current display text in case user typed something
+        textarea.value = displayText;
+        editingCommentId = null;
+        activeEditState = null;
         body.style.display     = '';
         editArea.style.display = 'none';
       });
 
-      tr.querySelector('.ma-edit-save').addEventListener('click', async ev => {
+      // ── Edit save ──────────────────────────────────────────────────────
+      const saveBtn = tr.querySelector('.ma-edit-save');
+      saveBtn.addEventListener('mousedown', ev => ev.stopPropagation());
+      saveBtn.addEventListener('pointerdown', ev => ev.stopPropagation());
+      saveBtn.addEventListener('click', async ev => {
         ev.stopPropagation();
+        ev.stopImmediatePropagation();
+        MALog.comment('edit_save_clicked', { commentId, path: filePath, isAi });
         const newText = textarea.value.trim();
-        if (!newText) return;
-        const btn = tr.querySelector('.ma-edit-save');
-        btn.disabled = true; btn.textContent = 'Saving…';
+        tr.querySelector('.ma-save-err')?.remove();
+        if (!newText) {
+          saveBtn.insertAdjacentHTML('afterend',
+            `<span style="color:#c62828;font-size:11px;margin-left:6px;" class="ma-save-err">⚠ Draft text cannot be empty.</span>`
+          );
+          return;
+        }
+        saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+        saveBtn.insertAdjacentHTML('afterend',
+          `<span style="color:#5f6368;font-size:11px;margin-left:6px;" class="ma-save-err">Saving...</span>`
+        );
 
         MALog.comment('edit_save_start', {
           commentId,
@@ -1511,8 +1474,21 @@ Gerrit.install(plugin => {
         try {
           const storageText = isAi ? AI_PREFIX + '\n\n' + newText : newText;
           const changeNum = getChangeNumber();
-          const patchSet = await getEffectivePatchSetNumber(changeNum);
-          await updateDraft(changeNum, patchSet, toGerritDraftId(commentId), storageText, !comment.resolved);
+          const patchSet =
+            comment.patchSet != null
+              ? String(comment.patchSet)
+              : await getEffectivePatchSetNumber(changeNum);
+          tr.querySelector('.ma-save-err')?.remove();
+          saveBtn.insertAdjacentHTML('afterend',
+            `<span style="color:#5f6368;font-size:11px;margin-left:6px;" class="ma-save-err">Sending update...</span>`
+          );
+          await Promise.race([
+            updateDraft(changeNum, patchSet, toGerritDraftId(commentId), storageText, !comment.resolved),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Saving draft timed out. Please retry.')), 12000)
+            ),
+          ]);
+          // Update in-memory comment text so subsequent re-renders show the new value
           comment.text = storageText;
           MALog.comment('edit_save_success', {
             commentId,
@@ -1520,16 +1496,26 @@ Gerrit.install(plugin => {
             newLength: newText.length,
             messagePreview: newText.slice(0, 80),
           });
-          displaySavedComments(table, filePath);
+          editingCommentId = null;
+          activeEditState = null;
+          // Re-render to show updated body text cleanly
+          displaySavedComments(table, filePath, { preserveOpenEdit: false });
         } catch (err) {
           MALog.error('edit_save_failed', {
             commentId,
             error: err?.message || String(err),
           });
-          btn.disabled = false; btn.textContent = 'Save draft';
+          saveBtn.disabled = false; saveBtn.textContent = 'Save draft';
+          const msg = err?.message || String(err) || 'Unknown error';
+          saveBtn.insertAdjacentHTML('afterend',
+            `<span style="color:#c62828;font-size:11px;margin-left:6px;" class="ma-save-err">⚠ ${escHtml(msg)}</span>`
+          );
+          // Keep edit session locked open so background refresh cannot interrupt retry.
+          editingCommentId = commentId;
         }
       });
 
+      // ── Discard button ─────────────────────────────────────────────────
       tr.querySelector('.ma-discard-btn').addEventListener('click', async ev => {
         ev.stopPropagation();
         MALog.comment('discard_clicked', {
@@ -1545,13 +1531,15 @@ Gerrit.install(plugin => {
         else    { btn.disabled = false; btn.textContent = 'Discard'; }
       });
 
-      // AC2: Hover highlight (respects persistent toggle)
+      // ── Hover highlight ────────────────────────────────────────────────
       tr.addEventListener('mouseenter', () => highlightLines(table, filePath, lines, true));
       tr.addEventListener('mouseleave', () => {
         if (!tr.classList.contains('ma-active')) highlightLines(table, filePath, lines, false);
       });
-      // AC3: Click to persistently toggle highlight
+      // ── Click to persistently toggle highlight ─────────────────────────
       tr.addEventListener('click', () => {
+        const active = document.activeElement;
+        if (active && ['TEXTAREA', 'INPUT', 'BUTTON'].includes(active.tagName)) return;
         const on = tr.classList.toggle('ma-active');
         MALog.ui('comment_highlight_toggled', {
           commentId,
@@ -1562,11 +1550,19 @@ Gerrit.install(plugin => {
         highlightLines(table, filePath, lines, on);
       });
 
-      // Insert after last anchor in this file
+      // ── Insert row into table ──────────────────────────────────────────
+      // FIX: fall back to table.appendChild() so the row stays inside the
+      // <table>. The original code called insertAdjacentElement('afterend') on
+      // the table itself when no anchor row was found, which inserts the <tr>
+      // *outside* the table — invisible and invalid HTML.
       const lastKeyHere = getLastAnchorKeyForFile(lines, filePath);
       const lastAnchor  = lastKeyHere ? parseAnchorKey(lastKeyHere) : null;
       const lastRow     = findRowForAnchor(table, lastAnchor);
-      (lastRow || table).insertAdjacentElement('afterend', tr);
+      if (lastRow) {
+        lastRow.insertAdjacentElement('afterend', tr);
+      } else {
+        table.appendChild(tr);
+      }
     });
 
     updateFabBadge();
@@ -1574,6 +1570,7 @@ Gerrit.install(plugin => {
 
   // ── Refresh visible diff ───────────────────────────────────────────────────
   function refreshCurrentDiffView() {
+    if (isEditSessionActive()) return;
     const diffElement = getDiffElement();
     const { table, filePath } = getTablePathPair(diffElement);
     if (!table || !filePath) return;
@@ -1595,12 +1592,6 @@ Gerrit.install(plugin => {
   /** @type {Set<string>} JSON anchor keys including file path */
   const selectedLines = new Set();
 
-  /**
-   * Applies/removes yellow selected styling directly on row cells.
-   * @param {HTMLTableRowElement} row
-   * @param {"left"|"right"} side
-   * @param {boolean} selected
-   */
   function setSelectedVisual(row, side, selected) {
     row.querySelectorAll(`td.${side}`).forEach(td => {
       td.classList.toggle('multi-anchor-selected', selected);
@@ -1667,13 +1658,6 @@ Gerrit.install(plugin => {
     return found;
   }
 
-  /**
-   * Creates and inserts a new draft comment box, using the ai_review card style.
-   * Placed below the last selected anchor in the currently visible file.
-   *
-   * @param {HTMLTableElement} table
-   * @param {string} filePath
-   */
   function showCommentBox(table, filePath) {
     removeDraftRowsDeep();
 
@@ -1739,9 +1723,14 @@ Gerrit.install(plugin => {
       </td>
     `;
 
+    // FIX: fall back to table.appendChild() instead of inserting outside the table
     const pos = parseAnchorKey(positionKey);
     const lastRow = findRowForAnchor(table, pos);
-    (lastRow || table).insertAdjacentElement('afterend', tr);
+    if (lastRow) {
+      lastRow.insertAdjacentElement('afterend', tr);
+    } else {
+      table.appendChild(tr);
+    }
 
     const textarea = tr.querySelector('.ma-new-textarea');
     textarea.focus();
@@ -1762,6 +1751,8 @@ Gerrit.install(plugin => {
       if (!text) return;
       const saveBtn = tr.querySelector('.ma-new-save');
       saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+      // Clear any previous error
+      tr.querySelector('.ma-save-err')?.remove();
 
       MALog.comment('new_draft_save_start', {
         filePath,
@@ -1774,36 +1765,30 @@ Gerrit.install(plugin => {
       });
 
       const { draft, error } = await createMultiAnchorComment(selectedLines, text, resolved);
-        if (draft) {
-          tr.remove(); clearSelectionDeep();
-          displaySavedComments(table, filePath);
-          MALog.comment('new_draft_saved', {
-            commentId:  draft.id,
-            filePath,
-            anchorCount: keys.length,
-            resolved,
-          });
-        } else {
-          saveBtn.disabled = false;
-          saveBtn.textContent = 'Save draft';
-          const msg = error?.message || String(error) || 'Unknown error';
-          saveBtn.insertAdjacentHTML('afterend',
-            `<span style="color:#c62828;font-size:11px;margin-left:6px;" class="ma-save-err">⚠ ${escHtml(msg)}</span>`
-          );
-          MALog.error('new_draft_save_failed', { filePath, error: msg });
-        }
+      if (draft) {
+        tr.remove(); clearSelectionDeep();
+        displaySavedComments(table, filePath);
+        MALog.comment('new_draft_saved', {
+          commentId:  draft.id,
+          filePath,
+          anchorCount: keys.length,
+          resolved,
+        });
+      } else {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save draft';
+        const msg = error?.message || String(error) || 'Unknown error';
+        saveBtn.insertAdjacentHTML('afterend',
+          `<span style="color:#c62828;font-size:11px;margin-left:6px;" class="ma-save-err">⚠ ${escHtml(msg)}</span>`
+        );
+        MALog.error('new_draft_save_failed', { filePath, error: msg });
+      }
     });
   }
 
   // ── Document-level click & keyboard listeners (multi-file safe) ───────────
   let documentHooksInstalled = false;
 
-  /**
-   * Finds the first element in composedPath() matching a selector.
-   * @param {Event} e
-   * @param {string} selector
-   * @returns {Element | null}
-   */
   function findPathElement(e, selector) {
     const path = (typeof e.composedPath === 'function') ? e.composedPath() : [e.target];
     for (const node of path) {
@@ -1817,10 +1802,6 @@ Gerrit.install(plugin => {
     return null;
   }
 
-  /**
-   * Ctrl/Cmd+click on any diff line toggles it as a pending anchor.
-   * Works across file navigations because it reads the file path from gr-diff-host.
-   */
   function onDocumentClickCapture(e) {
     if (!e.ctrlKey && !e.metaKey) return;
 
@@ -1853,16 +1834,11 @@ Gerrit.install(plugin => {
     e.stopPropagation();
   }
 
-  /**
-   * 'c' opens a comment box for the pending selection; Escape dismisses it.
-   * Uses capture phase to intercept before Gerrit's own 'c' shortcut.
-   */
   function onDocumentKeydownCapture(e) {
     const tag = e.target.tagName;
     const activeTag = document.activeElement && document.activeElement.tagName;
     if (tag === 'TEXTAREA' || tag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'INPUT') return;
 
-    // Ctrl+Shift+A is handled by the global listener for the AI panel
     if (e.ctrlKey && e.shiftKey && e.key === 'A') return;
 
     if (e.key === 'c' && hasDraftRowDeep()) return;
@@ -1909,6 +1885,8 @@ Gerrit.install(plugin => {
     const { table, filePath } = getTablePathPair(diffElement);
     if (!table || !filePath) { setTimeout(attachListeners, 500); return; }
 
+    setupNativeThreadHider();
+
     if (!documentHooksInstalled) {
       documentHooksInstalled = true;
       document.addEventListener('click', onDocumentClickCapture, true);
@@ -1923,22 +1901,25 @@ Gerrit.install(plugin => {
       attachPollInstalled = true;
       effectivePatchSetCache = { changeNum: null, urlToken: null, resolved: null };
       if (changeNum) {
-        // ── Phase 1: pre-populate managedGerritIds ASAP so the hider works
-        //    before the full load completes. getAllAdditionalRanges is cheap
-        //    (one Git read) and returns the keys we need to suppress threads.
-        getAllAdditionalRanges(changeNum).then(additionalRanges => {
-          if (!additionalRanges) return;
-          Object.keys(additionalRanges).forEach(storageKey => {
-            // storageKey is "{patchSet}/{rawGerritId}" — extract the raw ID
-            const rawId = storageKey.includes('/')
-              ? storageKey.split('/').slice(1).join('/')
-              : storageKey;
-            managedGerritIds.add(rawId);
+        // Phase 1: pre-populate managedGerritIds so the hider works immediately
+        Promise.all([
+          getAllAdditionalRanges(changeNum).catch(() => ({})),
+          restApi.get(`/changes/${changeNum}/revisions/${patchSet}/drafts`).catch(() => ({})),
+        ]).then(([additionalRanges, drafts]) => {
+          Object.keys(additionalRanges || {}).forEach(storageKey => {
+            managedGerritIds.add(toGerritDraftId(storageKey));
           });
-          setupNativeThreadHider(); // restart hider with pre-populated IDs
+          for (const comments of Object.values(drafts || {})) {
+            for (const comment of comments || []) {
+              if (comment?.message?.startsWith(AI_PREFIX)) {
+                managedGerritIds.add(comment.id);
+              }
+            }
+          }
+          setupNativeThreadHider();
         }).catch(() => {});
 
-        // ── Phase 2: full load (drafts + ranges), then render plugin UI
+        // Phase 2: full load, then render plugin UI
         loadMultiAnchorComments(changeNum, patchSet).then(() => {
           setupNativeThreadHider();
           displaySavedComments(table, filePath);
@@ -1947,9 +1928,8 @@ Gerrit.install(plugin => {
       setInterval(attachListeners, 700);
     }
 
-    setupNativeThreadHider();
-
     if (!commentsLoaded) return;
+    if (isEditSessionActive()) return;
 
     displaySavedComments(table, filePath);
     const applied = applyPendingSelectionToTable(table, filePath);
