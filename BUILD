@@ -21,3 +21,16 @@ junit_tests(
         ":multianchor_comment__plugin",
     ] + PLUGIN_TEST_DEPS + PLUGIN_DEPS,
 )
+
+sh_test(
+    name = "multianchor_comment_frontend_tests",
+    srcs = ["run_jest.sh"],
+    data = glob([
+        "src/main/resources/static/**/*.js",
+        "src/test/frontend/**/*.js",
+        "jest.config.cjs",
+        "package.json",
+        "package-lock.json",
+    ]),
+    tags = ["multianchor_comment", "frontend"],
+)
