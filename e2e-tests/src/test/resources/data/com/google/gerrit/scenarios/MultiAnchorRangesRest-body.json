@@ -1,0 +1,16 @@
+{
+  "ranges": [
+    {
+      "startLine": 2,
+      "startCharacter": 0,
+      "endLine": 2,
+      "endCharacter": 5
+    },
+    {
+      "startLine": 5,
+      "startCharacter": 0,
+      "endLine": 6,
+      "endCharacter": 10
+    }
+  ]
+}

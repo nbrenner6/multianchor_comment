@@ -1,0 +1,10 @@
+These paths mirror upstream Gerrit e2e-tests. Merge into a Gerrit checkout before running Gatling:
+
+  cp -R e2e-tests/src/. "$GERRIT_ROOT/e2e-tests/src/"
+
+Then:
+
+  cd "$GERRIT_ROOT/e2e-tests"
+  sbt "gatling:testOnly com.google.gerrit.scenarios.MultiAnchorRangesRest"
+
+The server must load multianchor_comment.
