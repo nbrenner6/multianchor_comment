@@ -1,11 +1,14 @@
 package com.googlesource.gerrit.plugins.multianchorcomment.storage;
 
+import static com.google.gerrit.server.update.context.RefUpdateContext.RefUpdateType.VERSIONED_META_DATA_CHANGE;
+
 import com.google.common.flogger.FluentLogger;
 import com.google.gerrit.entities.Change;
 import com.google.gerrit.entities.Project;
 import com.google.gerrit.server.CurrentUser;
 import com.google.gerrit.server.IdentifiedUser;
 import com.google.gerrit.server.git.GitRepositoryManager;
+import com.google.gerrit.server.update.context.RefUpdateContext;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.inject.Inject;
@@ -295,15 +298,17 @@ public class MultiAnchorStorage {
         }
         refUpdate.setRefLogMessage("Update multi-anchor anchors", false);
 
-        RefUpdate.Result result = refUpdate.update();
-        switch (result) {
-          case NEW:
-          case FAST_FORWARD:
-          case FORCED:
-            logger.atFine().log("Updated %s to %s", refName, commitId.name());
-            break;
-          default:
-            throw new IOException("Failed to update ref " + refName + ": " + result);
+        try (RefUpdateContext ctx = RefUpdateContext.open(VERSIONED_META_DATA_CHANGE)) {
+          RefUpdate.Result result = refUpdate.update();
+          switch (result) {
+            case NEW:
+            case FAST_FORWARD:
+            case FORCED:
+              logger.atFine().log("Updated %s to %s", refName, commitId.name());
+              break;
+            default:
+              throw new IOException("Failed to update ref " + refName + ": " + result);
+          }
         }
       }
     }

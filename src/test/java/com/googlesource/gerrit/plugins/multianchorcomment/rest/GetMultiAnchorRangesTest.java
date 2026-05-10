@@ -50,10 +50,12 @@ public class GetMultiAnchorRangesTest {
     getMultiAnchorRanges = new GetMultiAnchorRanges(storage);
   }
 
-  private MultiAnchorRangesResource mockResource(String project, int change, String uuid) {
+  private MultiAnchorRangesResource mockResource(
+      String project, int change, int patchSet, String uuid) {
     MultiAnchorRangesResource rsrc = mock(MultiAnchorRangesResource.class);
     when(rsrc.getProject()).thenReturn(Project.nameKey(project));
     when(rsrc.getChangeId()).thenReturn(Change.id(change));
+    when(rsrc.getPatchSet()).thenReturn(patchSet);
     when(rsrc.getCommentUuid()).thenReturn(uuid);
     return rsrc;
   }
@@ -69,14 +71,14 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testReturnsRangesFromStorage() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("projectA", 123, "uuid1");
+    MultiAnchorRangesResource rsrc = mockResource("projectA", 123, 2, "uuid1");
 
     List<Range> expected = Arrays.asList(
         makeRange(1, 0, 3, 5),
         makeRange(10, 2, 12, 8)
     );
 
-    when(storage.getRangesForComment(any(), any(), any())).thenReturn(expected);
+    when(storage.getRangesForComment(any(), any(), anyInt(), any())).thenReturn(expected);
 
     List<Range> actual = getMultiAnchorRanges.apply(rsrc).value();
 
@@ -87,9 +89,9 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testReturnsEmptyList() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 1, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 1, 1, "uuid");
 
-    when(storage.getRangesForComment(any(), any(), any()))
+    when(storage.getRangesForComment(any(), any(), anyInt(), any()))
         .thenReturn(Collections.emptyList());
 
     assertTrue(getMultiAnchorRanges.apply(rsrc).value().isEmpty());
@@ -97,10 +99,10 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testSingleRange() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 2, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 2, 3, "uuid");
 
     Range r = makeRange(5, 0, 5, 10);
-    when(storage.getRangesForComment(any(), any(), any()))
+    when(storage.getRangesForComment(any(), any(), anyInt(), any()))
         .thenReturn(Collections.singletonList(r));
 
     List<Range> actual = getMultiAnchorRanges.apply(rsrc).value();
@@ -111,9 +113,9 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testNullList() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 3, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 3, 1, "uuid");
 
-    when(storage.getRangesForComment(any(), any(), any())).thenReturn(null);
+    when(storage.getRangesForComment(any(), any(), anyInt(), any())).thenReturn(null);
 
     Response<List<Range>> resp = getMultiAnchorRanges.apply(rsrc);
 
@@ -122,22 +124,22 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testStorageCalledOnce() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 4, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 4, 5, "uuid");
 
-    when(storage.getRangesForComment(any(), any(), any()))
+    when(storage.getRangesForComment(any(), any(), anyInt(), any()))
         .thenReturn(Collections.emptyList());
 
     getMultiAnchorRanges.apply(rsrc);
 
-    verify(storage, times(1)).getRangesForComment(any(), any(), any());
+    verify(storage, times(1)).getRangesForComment(any(), any(), anyInt(), any());
   }
 
   @Test
   public void testThrowsIOException() {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 5, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 5, 1, "uuid");
 
     try {
-      when(storage.getRangesForComment(any(), any(), any()))
+        when(storage.getRangesForComment(any(), any(), anyInt(), any()))
           .thenThrow(new IOException("fail"));
 
       getMultiAnchorRanges.apply(rsrc);
@@ -149,10 +151,10 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testWeirdValues() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 6, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 6, 2, "uuid");
 
     Range r = makeRange(0, 0, -1, 5);
-    when(storage.getRangesForComment(any(), any(), any()))
+    when(storage.getRangesForComment(any(), any(), anyInt(), any()))
         .thenReturn(Collections.singletonList(r));
 
     assertEquals(-1, getMultiAnchorRanges.apply(rsrc).value().get(0).endLine);
@@ -160,13 +162,13 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testMultipleResources() throws IOException {
-    MultiAnchorRangesResource r1 = mockResource("p1", 1, "u1");
-    MultiAnchorRangesResource r2 = mockResource("p2", 2, "u2");
+    MultiAnchorRangesResource r1 = mockResource("p1", 1, 1, "u1");
+    MultiAnchorRangesResource r2 = mockResource("p2", 2, 2, "u2");
 
-    when(storage.getRangesForComment(Project.nameKey("p1"), Change.id(1), "u1"))
+    when(storage.getRangesForComment(Project.nameKey("p1"), Change.id(1), 1, "u1"))
         .thenReturn(Collections.singletonList(makeRange(1,1,2,2)));
 
-    when(storage.getRangesForComment(Project.nameKey("p2"), Change.id(2), "u2"))
+    when(storage.getRangesForComment(Project.nameKey("p2"), Change.id(2), 2, "u2"))
         .thenReturn(Collections.singletonList(makeRange(3,0,3,5)));
 
     assertEquals(2, getMultiAnchorRanges.apply(r1).value().get(0).endLine);
@@ -175,7 +177,7 @@ public class GetMultiAnchorRangesTest {
 
   @Test
   public void testLargeList() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 7, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 7, 3, "uuid");
 
     List<Range> list = Arrays.asList(
         makeRange(0,0,1,1),
@@ -183,16 +185,16 @@ public class GetMultiAnchorRangesTest {
         makeRange(4,0,5,1)
     );
 
-    when(storage.getRangesForComment(any(), any(), any())).thenReturn(list);
+    when(storage.getRangesForComment(any(), any(), anyInt(), any())).thenReturn(list);
 
     assertEquals(3, getMultiAnchorRanges.apply(rsrc).value().size());
   }
 
   @Test
   public void testSpecialStrings() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj!@#", 8, "uuid$%^");
+    MultiAnchorRangesResource rsrc = mockResource("proj!@#", 8, 4, "uuid$%^");
 
-    when(storage.getRangesForComment(any(), any(), any()))
+    when(storage.getRangesForComment(any(), any(), anyInt(), any()))
         .thenReturn(Collections.singletonList(makeRange(1,1,2,2)));
 
     assertEquals(2, getMultiAnchorRanges.apply(rsrc).value().get(0).endLine);
