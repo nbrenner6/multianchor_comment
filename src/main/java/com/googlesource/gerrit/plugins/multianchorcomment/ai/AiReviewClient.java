@@ -19,8 +19,8 @@ public class AiReviewClient {
     public Range primaryRange;
   }
 
-  private record AiRangeJson(int startLine, int startCharacter, int endLine, int endCharacter) {}
-  private record AiCommentJson(String path, String message, List<AiRangeJson> ranges) {}
+  record AiRangeJson(int startLine, int startCharacter, int endLine, int endCharacter) {}
+  record AiCommentJson(String path, String message, List<AiRangeJson> ranges) {}
   private record Message(String role, String content) {}
   private record ChatRequest(String model, String system, List<Message> messages, int max_tokens) {}
 
@@ -117,7 +117,7 @@ public class AiReviewClient {
     return raw.stream().map(this::toAiComment).toList();
   }
 
-  private AiComment toAiComment(AiCommentJson raw) {
+  AiComment toAiComment(AiCommentJson raw) {
     AiComment c   = new AiComment();
     c.path        = raw.path();
     c.message     = raw.message();
@@ -133,7 +133,7 @@ public class AiReviewClient {
     return c;
   }
 
-  private String extractContent(String responseBody) {
+  String extractContent(String responseBody) {
     var parsed  = gson.fromJson(responseBody, java.util.Map.class);
 
     // Surface stop_reason so truncation is visible in logs
@@ -171,7 +171,7 @@ public class AiReviewClient {
    * Returns the longest valid prefix as a closed array:
    *   [{"a":1}, {"b":2}]
    */
-  private String recoverTruncatedJsonArray(String text) {
+  String recoverTruncatedJsonArray(String text) {
     // Walk backwards from the end to find the last '}' that closes a complete object.
     // Then close the array after it.
     int depth = 0;
