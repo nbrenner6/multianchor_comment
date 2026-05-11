@@ -834,6 +834,7 @@ Gerrit.install(plugin => {
   let panelEl = null;
   let logEl   = null;
 
+  /* istanbul ignore start */
   function injectAiPanel() {
     if (document.getElementById('ma-ai-fab-wrapper')) return;
     if (document.getElementById('ma-ai-fab')) return;
@@ -1075,6 +1076,7 @@ Gerrit.install(plugin => {
   }
 
   function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+  /* istanbul ignore end */
 
   // ── FAB badge ─────────────────────────────────────────────────────────────
   function updateFabBadge() {
@@ -1109,6 +1111,7 @@ Gerrit.install(plugin => {
   let nativeObserver = null;
   let hidePoller     = null;
 
+  /* istanbul ignore start */
   function setupNativeThreadHider() {
     const grDiffHost = getGrDiffHost();
     if (!grDiffHost?.shadowRoot) return;
@@ -1171,6 +1174,7 @@ Gerrit.install(plugin => {
     `;
     shadowRoot.appendChild(s);
   }
+  /* istanbul ignore end */
 
   // ── Diff table helpers ────────────────────────────────────────────────────
   function escHtml(t) {
@@ -1875,6 +1879,7 @@ Gerrit.install(plugin => {
   let attachPollInstalled  = false;
   let lastLoadTs = 0;
 
+  /* istanbul ignore start */
   async function attachListeners() {
     const diffElement = getDiffElement();
     if (!diffElement) { setTimeout(attachListeners, 500); return; }
@@ -1949,5 +1954,84 @@ Gerrit.install(plugin => {
     }
   }
 
-  setTimeout(attachListeners, 1000);
+  if (typeof window !== 'undefined' && window.__MULTIANCHOR_TEST__) {
+    window.__multianchorTestApi = {
+      AI_PREFIX,
+      makeAnchorKey,
+      parseAnchorKey,
+      formatAnchorLabel,
+      formatGroupedAnchorLabels,
+      toPluginUrlId,
+      toPluginStorageKey,
+      toGerritDraftId,
+      getChangeNumber,
+      getPatchSetNumber,
+      getFilePath,
+      loadHistory,
+      pushHistory,
+      getPendingAnchorStats,
+      hasPendingAnchorsForFile,
+      applyPendingSelectionToTable,
+      schedulePendingSelectionReapply,
+      markAnchoredLines,
+      addRangeBadge,
+      highlightLines,
+      setSelectedVisual,
+      toggleLine,
+      clearSelectionDeep,
+      removeDraftRowsDeep,
+      hasDraftRowDeep,
+      showCommentBox,
+      refreshCurrentDiffView,
+      ensureStylesInjected,
+      injectStyles,
+      injectAiPanel,
+      refreshHistoryDropdown,
+      togglePanel,
+      closePanel,
+      logMsg,
+      clearLog,
+      updateFabBadge,
+      setupNativeThreadHider,
+      injectHiderStyle,
+      findPathElement,
+      onDocumentClickCapture,
+      onDocumentKeydownCapture,
+      walkShadowTree,
+      getTablePathPair,
+      getFilePathForDiffContext,
+      getDiffElement,
+      getGrDiffHost,
+      displaySavedComments,
+      loadMultiAnchorComments,
+      createMultiAnchorComment,
+      deleteMultiAnchorComment,
+      createDraft,
+      updateDraft,
+      deleteDraft,
+      saveAdditionalRanges,
+      deleteAdditionalRanges,
+      getAllAdditionalRanges,
+      anchorKeysToRanges,
+      getLastAnchorKeyForFile,
+      findRowForAnchor,
+      escHtml,
+      isEditSessionActive,
+      getActiveEditState: () => activeEditState,
+      setActiveEditState: value => { activeEditState = value; },
+      getEditingCommentId: () => editingCommentId,
+      setEditingCommentId: value => { editingCommentId = value; },
+      getSavedCommentsSnapshot: () => Array.from(savedComments.entries()),
+      setSavedComment: (key, value) => savedComments.set(key, value),
+      clearSavedComments: () => savedComments.clear(),
+      getManagedIds: () => Array.from(managedGerritIds.values()),
+      clearManagedIds: () => managedGerritIds.clear(),
+      getSelectedLines: () => Array.from(selectedLines.values()),
+      clearSelectedLines: () => selectedLines.clear(),
+      MALog,
+    };
+  } else {
+    setTimeout(attachListeners, 1000);
+  }
+  /* istanbul ignore end */
 });

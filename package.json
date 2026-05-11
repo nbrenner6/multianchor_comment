@@ -1,0 +1,22 @@
+{
+  "name": "multianchor_comment",
+  "version": "1.0.0",
+  "description": "Gerrit plugin for multi-anchored draft comments.",
+  "private": true,
+  "scripts": {
+    "test": "jest --config jest.config.cjs --runInBand --coverage",
+    "test:watch": "jest --config jest.config.cjs --watch"
+  },
+  "keywords": [
+    "gerrit",
+    "plugin",
+    "multianchor",
+    "jest"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "jest": "^30.4.0",
+    "jest-environment-jsdom": "^30.4.0"
+  }
+}
