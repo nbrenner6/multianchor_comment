@@ -1,6 +1,7 @@
 package com.googlesource.gerrit.plugins.multianchorcomment.rest;
 
 import static org.junit.Assert.*;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import java.io.IOException;
@@ -45,31 +46,33 @@ public class DeleteMultiAnchorRangesTest {
     deleteMultiAnchorRanges = new DeleteMultiAnchorRanges(storage);
   }
 
-  private MultiAnchorRangesResource mockResource(String project, int change, String uuid) {
+  private MultiAnchorRangesResource mockResource(
+      String project, int change, int patchSet, String uuid) {
     MultiAnchorRangesResource rsrc = mock(MultiAnchorRangesResource.class);
     when(rsrc.getProject()).thenReturn(Project.nameKey(project));
     when(rsrc.getChangeId()).thenReturn(Change.id(change));
+    when(rsrc.getPatchSet()).thenReturn(patchSet);
     when(rsrc.getCommentUuid()).thenReturn(uuid);
     return rsrc;
   }
 
   @Test
   public void testNormalDeletion() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 1, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 1, 1, "uuid");
 
     Response<?> resp = deleteMultiAnchorRanges.apply(rsrc, new DeleteMultiAnchorRanges.Input());
 
     assertNotNull(resp);
-    verify(storage).deleteRanges(Project.nameKey("proj"), Change.id(1), "uuid");
+    verify(storage).deleteRanges(Project.nameKey("proj"), Change.id(1), 1, "uuid");
   }
 
   @Test
   public void testThrowsIOException() {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 2, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 2, 1, "uuid");
 
     try {
       doThrow(new IOException("fail"))
-          .when(storage).deleteRanges(any(), any(), any());
+          .when(storage).deleteRanges(any(), any(), anyInt(), any());
 
       deleteMultiAnchorRanges.apply(rsrc, new DeleteMultiAnchorRanges.Input());
       fail("Expected IOException");
@@ -80,32 +83,32 @@ public class DeleteMultiAnchorRangesTest {
 
   @Test
   public void testCalledOnce() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 3, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 3, 1, "uuid");
 
     deleteMultiAnchorRanges.apply(rsrc, new DeleteMultiAnchorRanges.Input());
 
-    verify(storage, times(1)).deleteRanges(any(), any(), any());
+    verify(storage, times(1)).deleteRanges(any(), any(), anyInt(), any());
   }
 
   @Test
   public void testMultipleCalls() throws IOException {
-    MultiAnchorRangesResource rsrc = mockResource("proj", 4, "uuid");
+    MultiAnchorRangesResource rsrc = mockResource("proj", 4, 1, "uuid");
 
     deleteMultiAnchorRanges.apply(rsrc, new DeleteMultiAnchorRanges.Input());
     deleteMultiAnchorRanges.apply(rsrc, new DeleteMultiAnchorRanges.Input());
 
-    verify(storage, times(2)).deleteRanges(any(), any(), any());
+    verify(storage, times(2)).deleteRanges(any(), any(), anyInt(), any());
   }
 
   @Test
   public void testDifferentResources() throws IOException {
-    MultiAnchorRangesResource r1 = mockResource("p1", 1, "u1");
-    MultiAnchorRangesResource r2 = mockResource("p2", 2, "u2");
+    MultiAnchorRangesResource r1 = mockResource("p1", 1, 1, "u1");
+    MultiAnchorRangesResource r2 = mockResource("p2", 2, 1, "u2");
 
     deleteMultiAnchorRanges.apply(r1, new DeleteMultiAnchorRanges.Input());
     deleteMultiAnchorRanges.apply(r2, new DeleteMultiAnchorRanges.Input());
 
-    verify(storage).deleteRanges(Project.nameKey("p1"), Change.id(1), "u1");
-    verify(storage).deleteRanges(Project.nameKey("p2"), Change.id(2), "u2");
+    verify(storage).deleteRanges(Project.nameKey("p1"), Change.id(1), 1, "u1");
+    verify(storage).deleteRanges(Project.nameKey("p2"), Change.id(2), 1, "u2");
   }
 }
