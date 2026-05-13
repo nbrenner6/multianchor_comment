@@ -1,161 +1,213 @@
 package com.googlesource.gerrit.plugins.multianchorcomment.ai;
 
-import static com.google.common.truth.Truth.assertThat;
-import static org.junit.Assert.assertThrows;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.junit.Assert.*;
+import static org.mockito.Mockito.*;
 
-import com.google.gerrit.server.config.PluginConfig;
-import com.google.gerrit.server.config.PluginConfigFactory;
-import com.google.gson.JsonSyntaxException;
-import com.sun.net.httpserver.HttpServer;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
+import com.google.gerrit.extensions.client.Comment.Range;
 import java.util.List;
+import org.junit.Before;
 import org.junit.Test;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
 
 public class AiReviewClientTest {
 
-  @Test
-  public void reviewParsesJsonResponse() throws Exception {
-    String responseBody =
-        "{\"content\":[{\"text\":\"" +
-        "[{\\\"path\\\":\\\"a.txt\\\",\\\"message\\\":\\\"msg\\\"," +
-        "\\\"ranges\\\":[{\\\"startLine\\\":1,\\\"startCharacter\\\":0," +
-        "\\\"endLine\\\":1,\\\"endCharacter\\\":1}]}]" +
-        "\"}],\"stop_reason\":null}";
+  @Mock private AiReviewConfig config;
+  private AiReviewClient client;
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      List<AiReviewClient.AiComment> comments = client.review("diff", "");
-
-      assertThat(comments).hasSize(1);
-      assertThat(comments.get(0).path).isEqualTo("a.txt");
-      assertThat(comments.get(0).allRanges).hasSize(1);
-      assertThat(comments.get(0).primaryRange.endCharacter).isEqualTo(1);
-    }
+  @Before
+  public void setUp() {
+    MockitoAnnotations.initMocks(this);
+    when(config.getApiKey()).thenReturn("test-key");
+    when(config.getApiUrl()).thenReturn("https://api.example.com/v1/messages");
+    when(config.getModel()).thenReturn("test-model");
+    client = new AiReviewClient(config);
   }
 
+  // --- extractContent tests ---
+
   @Test
-  public void reviewRecoversTruncatedJsonArray() throws Exception {
-    String responseBody =
-        "{\"content\":[{\"text\":\"" +
-        "[{\\\"path\\\":\\\"a.txt\\\",\\\"message\\\":\\\"msg\\\"," +
-        "\\\"ranges\\\":[{\\\"startLine\\\":1,\\\"startCharacter\\\":0," +
-        "\\\"endLine\\\":1,\\\"endCharacter\\\":1}]}," +
-        "{\\\"path\\\":\\\"b.txt\\\",\\\"message\\\":\\\"msg2\\\"," +
-      "\\\"ranges\\\":[{\\\"startLine\\\":2,\\\"startCharacter\\\":0" +
-      "\"}],\"stop_reason\":\"max_tokens\"}";
+  public void testExtractContentNormalResponse() {
+    String response = """
+        {"content":[{"text":"[{\\"path\\":\\"a.java\\"}]"}],"stop_reason":"end_turn"}""";
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      List<AiReviewClient.AiComment> comments = client.review("diff", "");
+    String result = client.extractContent(response);
 
-      assertThat(comments).hasSize(1);
-      assertThat(comments.get(0).path).isEqualTo("a.txt");
-    }
+    assertEquals("[{\"path\":\"a.java\"}]", result);
   }
 
   @Test
-  public void reviewRecoversWithNoCompleteObjects() throws Exception {
-    String truncated = "[{\"path\":\"a.txt\"";
-    String responseBody =
-      "{\"content\":[{\"text\":\"" + jsonEscape(truncated) + "\"}]," +
-      "\"stop_reason\":\"max_tokens\"}";
+  public void testExtractContentStripsMarkdownFences() {
+    String response = """
+        {"content":[{"text":"```json\\n[{\\"path\\":\\"a.java\\"}]\\n```"}],"stop_reason":"end_turn"}""";
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      List<AiReviewClient.AiComment> comments = client.review("diff", "");
+    String result = client.extractContent(response);
 
-      assertThat(comments).isEmpty();
-    }
+    assertEquals("[{\"path\":\"a.java\"}]", result);
   }
 
   @Test
-  public void reviewRecoversTrailingComma() throws Exception {
-    String truncated =
-      "[{\"path\":\"a.txt\",\"message\":\"msg\"," +
-      "\"ranges\":[{\"startLine\":1,\"startCharacter\":0," +
-      "\"endLine\":1,\"endCharacter\":1}],}";
-    String responseBody =
-      "{\"content\":[{\"text\":\"" + jsonEscape(truncated) + "\"}]," +
-      "\"stop_reason\":\"max_tokens\"}";
+  public void testExtractContentNoFences() {
+    String response = """
+        {"content":[{"text":"[{\\"path\\":\\"b.java\\"}]"}],"stop_reason":"end_turn"}""";
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      assertThrows(JsonSyntaxException.class, () -> client.review("diff", ""));
-    }
+    String result = client.extractContent(response);
+
+    assertEquals("[{\"path\":\"b.java\"}]", result);
+  }
+
+  @Test(expected = RuntimeException.class)
+  public void testExtractContentNullContent() {
+    String response = """
+        {"error":"something went wrong"}""";
+
+    client.extractContent(response);
   }
 
   @Test
-  public void reviewStripsMarkdownFence() throws Exception {
-    String responseBody =
-        "{\"content\":[{\"text\":\"```json\\n" +
-        "[{\\\"path\\\":\\\"a.txt\\\",\\\"message\\\":\\\"msg\\\"," +
-        "\\\"ranges\\\":[{\\\"startLine\\\":1,\\\"startCharacter\\\":0," +
-        "\\\"endLine\\\":1,\\\"endCharacter\\\":1}]}]\\n```\"}]," +
-        "\"stop_reason\":null}";
+  public void testExtractContentMaxTokensTruncation() {
+    // When stop_reason is max_tokens and JSON is truncated, recovery should kick in
+    String response = """
+        {"content":[{"text":"[{\\"path\\":\\"a.java\\",\\"message\\":\\"ok\\",\\"ranges\\":[]}  ,  {\\"incompl"}],"stop_reason":"max_tokens"}""";
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      List<AiReviewClient.AiComment> comments = client.review("diff", "");
+    String result = client.extractContent(response);
 
-      assertThat(comments).hasSize(1);
-      assertThat(comments.get(0).path).isEqualTo("a.txt");
-    }
+    // Should recover the first complete object
+    assertTrue(result.startsWith("["));
+    assertTrue(result.endsWith("]"));
+    assertTrue(result.contains("a.java"));
+    assertFalse(result.contains("incompl"));
   }
 
   @Test
-  public void reviewFailsWithoutContent() throws Exception {
-    String responseBody = "{\"stop_reason\":null}";
+  public void testExtractContentNonMaxTokensStopReason() {
+    // When stop_reason is not max_tokens, no recovery should happen even if JSON looks incomplete
+    String response = """
+        {"content":[{"text":"[{\\"path\\":\\"a.java\\"}]"}],"stop_reason":"end_turn"}""";
 
-    try (TestServer server = new TestServer(responseBody)) {
-      AiReviewClient client = createClient(server.url());
-      assertThrows(RuntimeException.class, () -> client.review("diff", ""));
-    }
+    String result = client.extractContent(response);
+
+    assertEquals("[{\"path\":\"a.java\"}]", result);
   }
 
-  private AiReviewClient createClient(String url) {
-    PluginConfigFactory configFactory = mock(PluginConfigFactory.class);
-    PluginConfig config = mock(PluginConfig.class);
-    when(configFactory.getFromGerritConfig("multianchor_comment")).thenReturn(config);
-    when(config.getString(eq("aiApiKey"), anyString())).thenReturn("test-key");
-    when(config.getString(eq("aiApiUrl"), anyString())).thenReturn(url);
-    when(config.getString(eq("aiModel"), anyString())).thenReturn("gpt-4o");
+  // --- recoverTruncatedJsonArray tests ---
 
-    return new AiReviewClient(new AiReviewConfig(configFactory, "multianchor_comment"));
+  @Test
+  public void testRecoverTruncatedJsonArrayCompleteObjects() {
+    String input = "[{\"a\":1},{\"b\":2},{\"c\":\"incomplet";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    assertEquals("[{\"a\":1},{\"b\":2}]", result);
   }
 
-  private static class TestServer implements AutoCloseable {
-    private final HttpServer server;
+  @Test
+  public void testRecoverTruncatedJsonArrayNoCompleteObjects() {
+    String input = "[{\"a\":\"no closing brace";
 
-    private TestServer(String responseBody) throws IOException {
-      server = HttpServer.create(new InetSocketAddress(0), 0);
-      server.createContext("/", exchange -> {
-        byte[] body = responseBody.getBytes(StandardCharsets.UTF_8);
-        exchange.sendResponseHeaders(200, body.length);
-        try (OutputStream os = exchange.getResponseBody()) {
-          os.write(body);
-        }
-      });
-      server.start();
-    }
+    String result = client.recoverTruncatedJsonArray(input);
 
-    private String url() {
-      return "http://localhost:" + server.getAddress().getPort();
-    }
-
-    @Override
-    public void close() {
-      server.stop(0);
-    }
+    assertEquals("[]", result);
   }
 
-  private static String jsonEscape(String value) {
-    return value.replace("\\", "\\\\").replace("\"", "\\\"");
+  @Test
+  public void testRecoverTruncatedJsonArrayTrailingComma() {
+    String input = "[{\"a\":1},  {\"b\":\"trunc";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    // Should remove trailing comma after last complete object
+    assertEquals("[{\"a\":1}]", result);
+  }
+
+  @Test
+  public void testRecoverTruncatedJsonArrayWithStrings() {
+    // Braces inside strings should be ignored
+    String input = "[{\"msg\":\"use { and } carefully\"},{\"incomp";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    assertEquals("[{\"msg\":\"use { and } carefully\"}]", result);
+  }
+
+  @Test
+  public void testRecoverTruncatedJsonArrayWithEscapedQuotes() {
+    // Escaped quotes inside strings should be handled
+    String input = "[{\"msg\":\"say \\\"hello\\\"\"},{\"trunc";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    assertEquals("[{\"msg\":\"say \\\"hello\\\"\"}]", result);
+  }
+
+  @Test
+  public void testRecoverTruncatedJsonArraySingleCompleteObject() {
+    String input = "[{\"path\":\"a.java\"},{\"path\":\"b.ja";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    assertEquals("[{\"path\":\"a.java\"}]", result);
+  }
+
+  @Test
+  public void testRecoverTruncatedJsonArrayAlreadyComplete() {
+    // Already has all complete objects (just missing closing bracket)
+    String input = "[{\"a\":1},{\"b\":2}";
+
+    String result = client.recoverTruncatedJsonArray(input);
+
+    assertEquals("[{\"a\":1},{\"b\":2}]", result);
+  }
+
+  // --- toAiComment tests ---
+
+  @Test
+  public void testToAiCommentFieldMapping() {
+    AiReviewClient.AiCommentJson raw = new AiReviewClient.AiCommentJson(
+        "src/Main.java",
+        "Fix this bug",
+        List.of(new AiReviewClient.AiRangeJson(10, 0, 12, 5))
+    );
+
+    AiReviewClient.AiComment result = client.toAiComment(raw);
+
+    assertEquals("src/Main.java", result.path);
+    assertEquals("Fix this bug", result.message);
+    assertEquals(1, result.allRanges.size());
+    assertNotNull(result.primaryRange);
+    assertEquals(10, result.primaryRange.startLine);
+    assertEquals(0, result.primaryRange.startCharacter);
+    assertEquals(12, result.primaryRange.endLine);
+    assertEquals(5, result.primaryRange.endCharacter);
+  }
+
+  @Test
+  public void testToAiCommentMultipleRanges() {
+    AiReviewClient.AiCommentJson raw = new AiReviewClient.AiCommentJson(
+        "src/Foo.java",
+        "Repeated pattern",
+        List.of(
+            new AiReviewClient.AiRangeJson(1, 0, 3, 0),
+            new AiReviewClient.AiRangeJson(10, 2, 15, 8),
+            new AiReviewClient.AiRangeJson(20, 0, 22, 0)
+        )
+    );
+
+    AiReviewClient.AiComment result = client.toAiComment(raw);
+
+    assertEquals(3, result.allRanges.size());
+    // Primary range should be the first one
+    assertEquals(1, result.primaryRange.startLine);
+
+    // Verify all ranges are converted correctly
+    Range second = result.allRanges.get(1);
+    assertEquals(10, second.startLine);
+    assertEquals(2, second.startCharacter);
+    assertEquals(15, second.endLine);
+    assertEquals(8, second.endCharacter);
+
+    Range third = result.allRanges.get(2);
+    assertEquals(20, third.startLine);
+    assertEquals(22, third.endLine);
   }
 }

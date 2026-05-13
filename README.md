@@ -217,7 +217,24 @@ You should see a "Draft - Multi-anchor: <selected lines>" comment box appear!
 
 # Testing
 
-To run the test suite, run: `bazel test //plugins/multianchor_comment:multianchor_comment_tests`
+**Java (plugin + REST integration):** from the Gerrit repo root:
+
+```bash
+bazel test //plugins/multianchor_comment:multianchor_comment_tests
+```
+
+**Frontend (Jest):** from this directory (`plugins/multianchor_comment`):
+
+```bash
+npm ci          # or: npm install
+npm test        # runs Jest with coverage; see jest.config.cjs for thresholds
+```
+
+**Frontend via Bazel** (same as CI: copies sources into a temp dir, runs `npm ci` + `npm test`):
+
+```bash
+bazel test //plugins/multianchor_comment:multianchor_comment_frontend_tests
+```
 
 # Tips
 
