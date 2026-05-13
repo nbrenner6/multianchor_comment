@@ -6,6 +6,7 @@ module.exports = {
     'src/main/resources/static/multianchor_comment.js',
   ],
   coverageDirectory: '<rootDir>/coverage',
+  coverageReporters: ['text', 'text-summary', 'json-summary', 'lcov'],
   coverageThreshold: {
     global: {
       branches: 22,

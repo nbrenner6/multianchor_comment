@@ -25,45 +25,39 @@ public class AiReviewClient {
   private record ChatRequest(String model, String system, List<Message> messages, int max_tokens) {}
 
   private static final String SYSTEM_PROMPT = """
-    You are a code reviewer. Analyze the provided unified diff and return a JSON array
-    of review comments. Each comment must follow this exact schema:
+    You are a senior engineer doing a calm, proportionate code review. Analyze the unified diff
+    and return a JSON array of review comments. Each comment must follow this exact schema:
 
     [
       {
         "path": "src/Foo.java",
-        "message": "Your review comment explaining the issue across all highlighted locations",
+        "message": "Short, factual note. Prefer suggestions over demands. Acknowledge uncertainty.",
         "ranges": [
           {"startLine": 10, "startCharacter": 0, "endLine": 12, "endCharacter": 0},
-          {"startLine": 45, "startCharacter": 0, "endLine": 45, "endCharacter": 0},
-          {"startLine": 78, "startCharacter": 0, "endLine": 78, "endCharacter": 0}
+          {"startLine": 45, "startCharacter": 0, "endLine": 45, "endCharacter": 0}
         ]
       }
     ]
 
-    CRITICAL RULES - you MUST follow these:
+    Tone and scope (important):
+    - Be concise. Only flag issues that matter for correctness, security, maintainability, or
+      clear bugs. Skip nitpicks, style lecturing, and hypothetical problems unless very likely.
+    - Use neutral language ("consider", "might", "optional") rather than imperative scolding.
+    - Prefer fewer, higher-signal comments over flooding the diff. If the change looks fine,
+      return an empty array [].
+    - Do not repeat the same point in different wording across comments.
 
-    1. ALWAYS look for patterns that appear in MULTIPLE locations and group them into ONE
-       comment with MULTIPLE ranges. This is the most important feature of this review tool.
+    Multi-anchor (multiple ranges in one comment):
+    - When the *same* concrete issue genuinely appears in multiple places (e.g. same bug pattern
+      at several call sites), group those locations into ONE comment with multiple ranges.
+    - Do NOT force multi-range grouping: single-range comments are normal and welcome when each
+      issue is localized.
+    - Never merge unrelated observations just to use multiple ranges.
 
-    2. Examples of when to use multiple ranges:
-       - The same variable used incorrectly in several places -> one comment, all locations
-       - A missing null check that should appear at multiple call sites -> one comment, all sites
-       - A repeated code pattern that should be extracted -> one comment, all occurrences
-       - Inconsistent naming across several lines -> one comment, all affected lines
-       - The same anti-pattern repeated throughout the file -> one comment, every occurrence
-
-    3. NEVER post separate comments for the same issue appearing in multiple places.
-       Always combine them into one comment with multiple ranges.
-
-    4. Single-range comments are only acceptable for truly isolated issues that appear
-       exactly once and have no relation to any other part of the code.
-
-    5. Aim for at least 50% of your comments to have multiple ranges.
-
-    6. startLine/endLine are 1-based line numbers in the NEW file (lines starting with + or space).
-       Do NOT reference removed lines (starting with -).
-
-    7. Return ONLY the JSON array, no explanation, no markdown fences.
+    Technical rules:
+    - startLine/endLine are 1-based line numbers in the NEW file (lines starting with + or space).
+      Do NOT reference removed lines (starting with -).
+    - Return ONLY the JSON array, no explanation, no markdown fences.
     """;
 
   private final HttpClient http;
@@ -83,11 +77,10 @@ public class AiReviewClient {
 
   public List<AiComment> review(String diff, String userPrompt) throws Exception {
     String userContent = """
-    This code review tool supports multi-anchor comments — a single comment can highlight
-    multiple non-adjacent line ranges simultaneously. Please make heavy use of this feature
-    by grouping related issues across different locations into one comment with multiple ranges.
+    This tool can attach one comment to several line ranges when they share the same underlying
+    issue. Use that only when it truly helps the author; otherwise keep one range per comment.
 
-    Review this diff:
+    Review this diff with a light touch — prioritize blocking issues and clear improvements:
 
     """ + diff +
         (userPrompt != null && !userPrompt.isEmpty() ? "\n\nAdditional focus: " + userPrompt : "");

@@ -199,6 +199,7 @@ describe('multianchor_comment frontend UI behaviors', () => {
     const rightTd = row.querySelector('td.right.lineNum');
     rightTd.dataset.value = '77';
     const ev = {
+      button: 0,
       ctrlKey: true,
       metaKey: false,
       target: rightTd,
@@ -209,6 +210,62 @@ describe('multianchor_comment frontend UI behaviors', () => {
     api.onDocumentClickCapture(ev);
     expect(api.getSelectedLines().length).toBe(1);
     expect(ev.preventDefault).toHaveBeenCalled();
+  });
+
+  test('plain click anchors one line then ctrl-click adds another', () => {
+    const {api} = bootPlugin();
+    const host = document.createElement('gr-diff-host');
+    host.path = 'src/a.ts';
+    const shadow = host.attachShadow({mode: 'open'});
+    const table = document.createElement('table');
+    table.id = 'diffTable';
+    table.innerHTML = `
+      <tr>
+        <td class="right lineNum" data-value="77"><button class="lineNumButton"></button></td>
+        <td class="right"><div class="contentText">a</div></td>
+      </tr>
+      <tr>
+        <td class="right lineNum" data-value="88"><button class="lineNumButton"></button></td>
+        <td class="right"><div class="contentText">b</div></td>
+      </tr>`;
+    shadow.appendChild(table);
+    document.body.appendChild(host);
+    const rows = table.querySelectorAll('tr');
+    const td77 = rows[0].querySelector('td.right.lineNum');
+    const td88 = rows[1].querySelector('td.right.lineNum');
+
+    api.onDocumentClickCapture({
+      button: 0,
+      ctrlKey: false,
+      metaKey: false,
+      target: td77,
+      composedPath: () => [td77, rows[0], table],
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    });
+    expect(api.getSelectedLines().length).toBe(1);
+
+    api.onDocumentClickCapture({
+      button: 0,
+      ctrlKey: true,
+      metaKey: false,
+      target: td88,
+      composedPath: () => [td88, rows[1], table],
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    });
+    expect(api.getSelectedLines().length).toBe(2);
+
+    api.onDocumentClickCapture({
+      button: 0,
+      ctrlKey: false,
+      metaKey: false,
+      target: td88,
+      composedPath: () => [td88, rows[1], table],
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    });
+    expect(api.getSelectedLines().length).toBe(1);
   });
 
   test('onDocumentKeydownCapture escape path executes without errors', () => {
