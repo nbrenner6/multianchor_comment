@@ -209,7 +209,10 @@ $5 of credits will cover hundreds to thousands of test reviews.
 
 # Using the plugin
 
-Looking at a diff view for a commit, hold ctrl/cmd and select multiple (even non-adjacent) lines.
+Looking at a diff view for a commit:
+
+1. **Click once** (no modifier) on a line to set the **first anchor** — that line is selected.
+2. **Ctrl+click** (Windows/Linux) or **Cmd+click** (macOS) on other lines to **add** more anchors (any file in the change).
 
 Press 'c'
 
@@ -217,24 +220,100 @@ You should see a "Draft - Multi-anchor: <selected lines>" comment box appear!
 
 # Testing
 
-**Java (plugin + REST integration):** from the Gerrit repo root:
+## Run everything at once (recommended)
+
+From the **Gerrit repository root**, Java (JUnit) and frontend (Jest) tests run together:
+
+```bash
+bazel test //plugins/multianchor_comment:multianchor_comment_all_tests
+```
+
+Or from this plugin directory:
+
+```bash
+./run_all_plugin_tests.sh
+```
+
+The Jest `sh_test` prints a **coverage summary block** to its stdout (`=== multianchor_comment Jest coverage (totals) ===`). You often **will not see it** when:
+
+- Gerrit’s `.bazelrc` uses **`--test_output=errors`**, so **passing** tests hide logs, and/or  
+- results are **(cached)**, so Bazel does not re-run the test and prints almost nothing.
+
+**To see Jest coverage in the terminal under Bazel**, force a fresh run and show all test output:
+
+```bash
+bazel test //plugins/multianchor_comment:multianchor_comment_frontend_tests \
+  --test_output=all --cache_test_results=no
+```
+
+Same idea for the combined suite (only the Jest target will print the block; Java stays quiet unless it fails):
+
+```bash
+bazel test //plugins/multianchor_comment:multianchor_comment_all_tests \
+  --test_output=all --cache_test_results=no
+```
+
+Under Bazel, Jest also copies `coverage-summary.json` and `lcov.info` into undeclared outputs as `jest-coverage/` when `TEST_UNDECLARED_OUTPUTS_DIR` is set (see [undeclared outputs](https://bazel.build/reference/test-encyclopedia)).
+
+## Run targets individually
+
+**Java only** (plugin + REST integration):
 
 ```bash
 bazel test //plugins/multianchor_comment:multianchor_comment_tests
 ```
 
-**Frontend (Jest):** from this directory (`plugins/multianchor_comment`):
-
-```bash
-npm ci          # or: npm install
-npm test        # runs Jest with coverage; see jest.config.cjs for thresholds
-```
-
-**Frontend via Bazel** (same as CI: copies sources into a temp dir, runs `npm ci` + `npm test`):
+**Frontend only** (Jest under Bazel — isolated temp dir, `npm ci` + `npm test`):
 
 ```bash
 bazel test //plugins/multianchor_comment:multianchor_comment_frontend_tests
 ```
+
+**Frontend locally** (faster iteration; HTML + JSON coverage under `coverage/`):
+
+```bash
+cd plugins/multianchor_comment
+npm ci          # or: npm install
+npm test        # thresholds in jest.config.cjs; see coverage/lcov-report/index.html
+```
+
+## Coverage across the full suite
+
+The plugin is tested in **two languages**; coverage is **not merged into one percentage** (Java and JavaScript use different tooling).
+
+### JavaScript (Jest) — `multianchor_comment.js`
+
+| How | What you get |
+|-----|----------------|
+| **Local (simplest)** | `cd plugins/multianchor_comment && npm test` — full table + `coverage/coverage-summary.json` + `coverage/lcov.info` + `coverage/lcov-report/index.html` |
+| **Bazel** | Use `--test_output=all` (and usually `--cache_test_results=no`) on `multianchor_comment_frontend_tests` so the **`=== multianchor_comment Jest coverage (totals) ===`** block appears in the console |
+
+### Java (JUnit) — `src/main/java` / `src/test/java`
+
+| Command | Notes |
+|---------|--------|
+| `bazel test //plugins/multianchor_comment:multianchor_comment_tests` | Runs tests; **no** JaCoCo coverage report. |
+| `bazel coverage …` (see below) | Produces LCOV / per-test `coverage.dat` when JaCoCo can instrument the bytecode (see JDK note). |
+
+**Java coverage (recommended on this tree):** Gerrit’s default **JDK 25** bytecode often breaks Bazel’s JaCoCo step (`Unsupported class file major version 69`). Pin the **Java 21** toolchain for the coverage build and emit a combined LCOV file:
+
+```bash
+bazelisk coverage //plugins/multianchor_comment:multianchor_comment_tests \
+  --combined_report=lcov \
+  --test_output=errors \
+  --java_language_version=21 \
+  --java_runtime_version=remotejdk_21 \
+  --tool_java_language_version=21 \
+  --tool_java_runtime_version=remotejdk_21
+```
+
+After a successful run, Bazel prints where the merged report was written (typically under `bazel-out/_coverage/_coverage_report.dat` from the execution root, plus a per-target `coverage.dat` under `bazel-testlogs/.../multianchor_comment_tests/`). Convert to HTML with `genhtml` from the **lcov** package, for example:
+
+```bash
+genhtml "$(bazel info execution_root)/bazel-out/_coverage/_coverage_report.dat" -o /tmp/multianchor-java-coverage-html
+```
+
+(`bazel coverage` without the JDK 21 flags may still work once JaCoCo supports your default JDK; until then, use the block above or **IntelliJ → Run with Coverage** on the test classes.)
 
 # Tips
 

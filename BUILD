@@ -34,3 +34,14 @@ sh_test(
     ]),
     tags = ["multianchor_comment", "frontend"],
 )
+
+# Run Java (JUnit) and frontend (Jest) tests in one invocation:
+#   bazel test //plugins/multianchor_comment:multianchor_comment_all_tests
+test_suite(
+    name = "multianchor_comment_all_tests",
+    tests = [
+        ":multianchor_comment_tests",
+        ":multianchor_comment_frontend_tests",
+    ],
+    tags = ["multianchor_comment"],
+)

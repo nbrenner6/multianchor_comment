@@ -1807,7 +1807,17 @@ Gerrit.install(plugin => {
   }
 
   function onDocumentClickCapture(e) {
-    if (!e.ctrlKey && !e.metaKey) return;
+    if (e.button !== 0) return;
+
+    const t = e.target;
+    if (t && t.nodeType === 1) {
+      if (t.closest(
+        'gr-comment-thread, gr-dialog, .multi-anchor-thread, .multi-anchor-comment-row, ' +
+        '#ma-ai-panel, #ma-ai-fab-wrapper, textarea, input, select'
+      )) {
+        return;
+      }
+    }
 
     const currentDiffElement = findPathElement(e, 'gr-diff-element') || getDiffElement();
     ensureStylesInjected(currentDiffElement);
@@ -1832,7 +1842,21 @@ Gerrit.install(plugin => {
     if (!lineNum || lineNum === 'LOST' || lineNum === 'FILE') return;
 
     const lineKey = makeAnchorKey(filePath, side, lineNum);
-    toggleLine(lineKey, side, row);
+    const modifier = e.ctrlKey || e.metaKey;
+
+    if (!modifier) {
+      // File-explorer style: plain click starts a new single-line anchor; further lines
+      // are added with Ctrl/Cmd+click.
+      clearSelectionDeep();
+      toggleLine(lineKey, side, row);
+      MALog.anchor('anchor_line_plain_click', {
+        path: filePath,
+        side,
+        lineNum,
+      });
+    } else {
+      toggleLine(lineKey, side, row);
+    }
 
     e.preventDefault();
     e.stopPropagation();
