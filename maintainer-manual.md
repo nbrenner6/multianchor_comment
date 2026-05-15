@@ -143,7 +143,7 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 - If saving additional ranges fails after a draft is created, the draft is removed or the flow fails gracefully.
 - Deleting a multi-anchor draft cleans up plugin-stored ranges and surfaces partial failures in logs without breaking the user's discard flow.
 
-**Status:** In Progress (Sprint 3–4); core scoping logic delivered, edge case handling ongoing.
+**Status:** Delivered (Sprint 3–4); core scoping logic delivered, edge case handling ongoing.
 
 ---
 
@@ -151,13 +151,7 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 
 ### 3.1 Deployment Diagram
 
-> **TODO: INSERT UPDATED DEPLOYMENT DIAGRAM HERE** (draw.io, exported as PNG)
->
-> The diagram should be an updated version of Figure 2 from Report 1. Updates needed:
->
-> - Add "Anthropic API" as an external node that the Gerrit Server communicates with via HTTPS for the AI review feature (PostAiReview -> AiReviewClient -> api.anthropic.com)
-> - All other nodes remain the same: Personal Computer (Web Browser / PolyGerrit UI + Git Client), Gerrit Server (gerrit.war daemon containing REST API, SSH Server, Plugin Layer), and Git Repository Storage (JGit / NoteDB)
-> - Communication: Browser <-> REST API on port 8080, Git Client <-> SSH Server on port 29418, Plugin Layer <-> Git Repository Storage via JGit, Plugin Layer <-> Anthropic API via HTTPS
+<img width="621" height="361" alt="Screenshot 2026-05-15 at 5 41 28 AM" src="https://github.com/user-attachments/assets/9a1829d4-2662-40d8-ab8f-46c8f241e611" />
 
 **Node Descriptions:**
 
@@ -179,17 +173,10 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 
 **Git Repository Storage (JGit / NoteDB):** Filesystem-level Git repository storage. Stores project code, review metadata, and the plugin's multi-anchor data in custom Git refs (`refs/meta/multianchor`). Accessed by the plugin via JGit.
 
-### 3.2 Component Diagram
+### 3.2 Class Diagram
 
-> **TODO: INSERT UPDATED COMPONENT DIAGRAM HERE** (draw.io, exported as PNG)
->
-> The diagram should be an updated version of Figure 3 from Report 1. Updates needed:
->
-> - Add "PostAiReview" endpoint component in the Backend section
-> - Add "AiReviewClient" component that makes HTTP calls to the external Anthropic API
-> - Add "Multi-File Anchor Handler" component or annotation showing that anchor metadata now includes file paths
-> - Add "Patchset Resolver" component or annotation showing implicit-to-explicit patchset resolution
-> - Update the description of "NoteDB Storage" to note patchset-scoped keys
+<img width="623" height="357" alt="Screenshot 2026-05-15 at 5 41 37 AM" src="https://github.com/user-attachments/assets/1a29a770-d9e7-4ebb-b98d-ffb8f03f6c4a" />
+
 
 **Frontend Components:**
 
@@ -211,55 +198,21 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 
 ---
 
-## 4. Class Diagrams
+## 4. Final User Interface Designs
 
-> **TODO: INSERT CLASS DIAGRAM(S) HERE** (draw.io, exported as PNG)
->
-> Create class diagrams covering the following key classes and relationships:
->
-> **Backend (Java):**
->
-> - `MultiAnchorCommentInfo` (extends `CommentInfo`) — Fields: additional ranges list, file paths, patchset ID
-> - `MultiAnchorStorage` — Dependencies: `GitRepositoryManager` (injected via Guice), `CurrentUser`; Methods: `save()`, `load()`, `delete()`
-> - REST endpoint classes: `GetMultiAnchorRanges`, `DeleteMultiAnchorRanges`, `PostAiReview`
-> - `AiReviewClient` — Dependencies: HTTP client, configuration (API URL, model, key); Methods: `sendReviewRequest()`, `parseResponse()`
-> - `PluginModule` (extends `AbstractModule`) — Binds all REST endpoints via Guice, registers with `RestApiModule`
->
-> Show: Inheritance arrows (e.g., `MultiAnchorCommentInfo` -> `CommentInfo`), composition/dependency arrows, Guice `@Inject` annotations.
->
-> **Frontend (JavaScript):**
->
-> - Main plugin module (`multianchor_comment.js`) — Key functions: line selection handling, comment box rendering, AI review button injection, multi-file coordination, patchset resolution; interactions with Shadow DOM and REST endpoints.
-> - This can be a module-level diagram rather than a strict class diagram.
+**Multi-Anchored Commenting**
+<img width="789" height="451" alt="Screenshot 2026-05-15 at 5 45 42 AM" src="https://github.com/user-attachments/assets/f52a96f0-c620-4339-a675-fe793b8b15ec" />
+
+
+**AI Review**
+
+<img width="354" height="400" alt="Screenshot 2026-05-15 at 5 03 02 AM" src="https://github.com/user-attachments/assets/4c6d5491-ff4d-4624-95a9-f97f387decd9" />
 
 ---
 
-## 5. Final User Interface Designs
+## 5. Developer Environment Setup & Deployment Procedure
 
-> **TODO: INSERT ANNOTATED SCREENSHOTS HERE**
->
-> Take screenshots from a running Gerrit instance showing each feature. Annotate with callouts distinguishing plugin UI from native Gerrit UI.
->
-> **Screenshot 1 — Single-File Multi-Anchored Commenting:**
-> Show the diff view with multiple non-adjacent lines highlighted in blue. Show the comment draft box with "Draft - Multi-anchor: lines" label. Annotate: highlight color, line number display, comment box location.
->
-> **Screenshot 2 — Cross-File Multi-Anchored Commenting:**
-> Show the comment draft box listing files and lines from multiple files. Show how the comment appears when switching between referenced files. Annotate: file path display, line references per file.
->
-> **Screenshot 3 — AI Review Feature:**
-> Show the "AI Review" button in the bottom-right corner. Show AI-generated multi-anchored comments in the diff view. Show the edit/resolve controls on an AI-generated draft. Annotate: button location, draft state indicators, anchor highlights.
->
-> **Screenshot 4 — Cross-Patchset Behavior:**
-> Show a multi-anchored comment on patchset N. Show the same change after uploading patchset N+1. Annotate: how ranges are scoped to the original patchset.
->
-> **Screenshot 5 — Comment Hover/Click Highlighting:**
-> Show how hovering over a multi-anchored comment highlights all associated lines. Annotate: highlight behavior, line number display in comment thread.
-
----
-
-## 6. Developer Environment Setup & Deployment Procedure
-
-### 6.1 Prerequisites
+### 5.1 Prerequisites
 
 - **Java:** JDK 21 or later (JDK 25 is Gerrit's current default; JDK 21 is needed for coverage builds)
 - **Bazel / Bazelisk:** Required for building Gerrit and the plugin
@@ -267,7 +220,7 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 - **SSH:** For communicating with the local Gerrit instance
 - **An Anthropic API key** (optional; required only for the AI review feature): obtain one at [https://console.anthropic.com](https://console.anthropic.com)
 
-### 6.2 First-Time Setup
+### 5.2 First-Time Setup
 
 Clone the Gerrit repository and place the plugin inside it:
 
@@ -291,7 +244,7 @@ Initialize a development Gerrit site:
 java -jar bazel-bin/gerrit.war init --batch --dev -d /tmp/gerrit-site
 ```
 
-### 6.3 Building the Plugin
+### 5.3 Building the Plugin
 
 ```bash
 bazel build //plugins/multianchor_comment:multianchor_comment
@@ -303,7 +256,7 @@ Copy the JAR to the development Gerrit site:
 sudo cp bazel-bin/plugins/multianchor_comment/multianchor_comment.jar /tmp/gerrit-site/plugins/
 ```
 
-### 6.4 Starting Gerrit
+### 5.4 Starting Gerrit
 
 Before starting, ensure no previous Gerrit processes are running:
 
@@ -321,11 +274,11 @@ java -jar bazel-bin/gerrit.war daemon --console-log -d /tmp/gerrit-site
 
 Open [http://localhost:8080](http://localhost:8080) in a browser. To sign in, click "sign in" and then click "admin" (no credentials needed in dev mode).
 
-### 6.5 Verifying Plugin Installation
+### 5.5 Verifying Plugin Installation
 
 Navigate to [http://localhost:8080/admin/plugins](http://localhost:8080/admin/plugins) and confirm that `multianchor_comment` is listed and enabled.
 
-### 6.6 Adding a Test Repository
+### 5.6 Adding a Test Repository
 
 Generate an SSH key for Gerrit:
 
@@ -375,7 +328,7 @@ git push ssh://admin@localhost:29418/<repo-name> HEAD:refs/for/master
 
 > **Troubleshooting:** If you re-initialized Gerrit, you may need to run `ssh-keygen -R "[localhost]:29418"` to clear stale host keys. If the user does not exist, you can create one with username "admin" and full name "Admin".
 
-### 6.7 AI Review Configuration
+### 5.7 AI Review Configuration
 
 The AI review feature requires an Anthropic API key configured on the Gerrit server.
 
@@ -429,7 +382,7 @@ The `chmod 600` ensures only the Gerrit process owner can read the key.
 | claude-sonnet-4-6         | ~$0.001    | ~$0.01     |
 | claude-opus-4-6           | ~$0.005    | ~$0.05     |
 
-### 6.8 Rebuilding After Changes
+### 5.8 Rebuilding After Changes
 
 When you make edits to the plugin source:
 
@@ -443,23 +396,24 @@ When done with Gerrit, press Ctrl+C in the terminal to shut down the daemon clea
 
 ---
 
-## 7. Style Guide & Developer Workflow
+## 6. Style Guide & Developer Workflow
 
-### 7.1 Branching Strategy
+### 6.1 Branching Strategy
 
-Each user story or feature is developed on its own branch. The developer implements all required functionality, tests it locally, and pushes the branch. The branch is merged into `main` only after passing the full code review process described below. Bug fix branches follow the same workflow.
+Each user story or feature is developed on its own branch that includes the story identifier for traceability. Branches are kept short-lived and rebased onto `main` regularly to reduce merge friction and keep reviews focused on the story delta. Developers implement the feature, run local tests (unit, integration, and frontend Jest where applicable), and validate behavior locally before opening a pull request. Large or cross-cutting work is split into smaller, reviewable commits and branches (for example: API changes, UX changes, and tests separated) to simplify review and potential rollback. Bug fix branches follow the same workflow.
 
-### 7.2 Code Review Process
+### 6.2 Code Review Process
 
-Before any PR is merged into `main`, it must be reviewed and approved by at least one team member who did not create the PR. This ensures code is examined by developers not directly involved in writing it, providing a fresh perspective on correctness, readability, and integration risks.
+Before any PR is merged into `main`, it must be reviewed and approved by at least one team member who did not author the change, with two reviewers requested for cross-cutting or higher-risk changes. Reviewers verify correctness, readability, test completeness, documentation/manual updates, and the PR's impact on behavior and UX.
+ 
+In addition to manual review, CodeRabbit.ai is configured on the repository to provide automated feedback on every PR. Developers evaluate and apply recommended fixes they deem appropriate and address review feedback through iterative commits in the same branch to keep the PR focused and the change history clear.
 
-In addition to manual review, CodeRabbit.ai is configured on the repository to provide automated feedback on every PR. Developers are responsible for evaluating CodeRabbit suggestions and addressing the relevant ones in subsequent revisions.
 
-### 7.3 Peer Programming
+### 6.3 Peer Programming
 
-Feature development is typically conducted in pairs, with two team members collaborating in real time before one commits the code. Pairs are assigned based on the user story assignee table and rotate across sprints to expose each member to different areas of the codebase (frontend, backend API, storage, testing).
+Pair programming is a deliberate practice for complex work such as integration tests, storage/ref fixes, UI refactors, and coverage improvements. Pairs are assigned based on the user story assignee table and rotate across sprints to expose each member to different areas of the codebase (frontend, backend API, storage, testing). For well-scoped fixes, developers work solo, reserving pairing for tasks where two contributors materially increase speed, confidence, or knowledge transfer.
 
-### 7.4 Commit Conventions
+### 6.4 Commit Conventions
 
 Commit messages use descriptive headers with PR references. Examples from the project:
 
@@ -470,11 +424,11 @@ Commit messages use descriptive headers with PR references. Examples from the pr
 
 Each commit header should clearly describe what was changed and why.
 
-### 7.5 PR Sizing
+### 6.5 PR Sizing
 
 PRs should be scoped to a single feature or user story. If a PR exceeds approximately 300 lines of changes, it should be split into smaller, independently reviewable units. This was adopted as a practice starting in Sprint 3 after client feedback that Sprint 2's two large PRs were difficult to review.
 
-### 7.6 Code Style
+### 6.6 Code Style
 
 **Java (Backend):** Follow Gerrit's existing code style conventions. The Gerrit codebase uses Google Java Style. Key points: 2-space indentation, Javadoc on public methods, Guice `@Inject` annotations on constructors.
 
@@ -482,9 +436,9 @@ PRs should be scoped to a single feature or user story. If a PR exceeds approxim
 
 ---
 
-## 8. Test Plan & Results
+## 7. Test Plan & Results
 
-### 8.1 Test Plan Overview
+### 7.1 Test Plan Overview
 
 The test suite follows the testing pyramid: approximately 80% unit tests, 15% integration tests, and 5% end-to-end tests.
 
@@ -499,7 +453,7 @@ The test suite follows the testing pyramid: approximately 80% unit tests, 15% in
 - Backend: JUnit 4 test suites integrated into the Bazel build pipeline.
 - Frontend: Jest test suites for `multianchor_comment.js`, runnable via Bazel or locally via `npm test`.
 
-### 8.2 How to Run the Tests
+### 7.2 How to Run the Tests
 
 **Run all tests (recommended):**
 
@@ -547,7 +501,7 @@ bazel test //plugins/multianchor_comment:multianchor_comment_frontend_tests \
 
 Jest copies `coverage-summary.json` and `lcov.info` into undeclared outputs as `jest-coverage/` when `TEST_UNDECLARED_OUTPUTS_DIR` is set.
 
-### 8.3 Coverage
+### 7.3 Coverage
 
 Coverage is tracked separately for Java and JavaScript since they use different tooling.
 
@@ -578,68 +532,62 @@ genhtml "$(bazel info execution_root)/bazel-out/_coverage/_coverage_report.dat" 
 
 **Coverage targets:** 90% line coverage, 85% branch coverage.
 
-> **TODO: INSERT FINAL COVERAGE NUMBERS HERE** once Sprint 4 is complete. Include both Java and JS coverage metrics.
+Java (backend) met both targets:
 
-### 8.4 Test Inventory
+<img width="618" height="133" alt="Screenshot 2026-05-15 at 5 49 18 AM" src="https://github.com/user-attachments/assets/7f195fb9-9b5a-4f68-824d-3eaf003784a7" />
 
-**Backend test files:**
+JavaScript (frontend) coverage via Jest:
 
-| File                               | Covers                                               |
-| ---------------------------------- | ---------------------------------------------------- |
-| `GetMultiAnchorRangesTest.java`    | GET endpoint — retrieval of multi-anchor range data  |
-| `DeleteMultiAnchorRangesTest.java` | DELETE endpoint — removal of multi-anchor range data |
+<img width="626" height="100" alt="Screenshot 2026-05-15 at 6 18 40 AM" src="https://github.com/user-attachments/assets/c9fc2325-987f-4fb3-951e-260a63a9854f" />
 
-> **TODO: ADD** any additional test files created in Sprint 4 (e.g., PostAiReview tests, integration tests, cross-patchset tests).
+The JavaScript coverage targets were not attainable at the level set for Java. The frontend logic runs inside Gerrit's Shadow DOM and is not directly accessible to Jest in the same way backend endpoints are to JUnit. Iterating on the test suite showed that achieving higher coverage would require splitting functions and files in non-intuitive ways that inflate the metrics without adding meaningful assurance. Jest remained highly useful for exercising scoped, predescribed interactions with the frontend.
 
-**Frontend test files:**
 
-> **TODO: LIST** Jest test files from the `plugins/multianchor_comment/__tests__/` directory.
+### 7.4 Integration & End-to-End Testing
 
-### 8.5 Integration & End-to-End Testing
+<img width="337" height="59" alt="Screenshot 2026-05-15 at 6 00 24 AM" src="https://github.com/user-attachments/assets/8f183e5b-dab6-4a84-ba60-09143e83e576" />
 
-> **TODO: DESCRIBE** the integration and E2E tests that exist at project end.
->
-> **Integration tests** should cover: pairwise and triplet functionality of endpoints, plugin toggleability (enable/disable without breaking native Gerrit), and combinations of multi-anchor operations (create, edit, delete).
->
-> **E2E tests** should cover: full workflow (push commit, create multi-anchor comment, save, reload, verify persistence), AI review workflow (push commit, trigger AI review, edit draft, resolve), and cross-file workflow (select lines across files, create comment, verify on each file).
->
-> If using Gerrit's `AbstractDaemonTest` framework, document how tests extend it. If relying on manual E2E testing, document the test scenarios and expected outcomes so a future maintainer can reproduce them.
+<img width="621" height="67" alt="Screenshot 2026-05-15 at 6 00 29 AM" src="https://github.com/user-attachments/assets/9f248583-dae9-4c57-80a9-7d72072dd497" />
 
-### 8.6 User Testing Results
+Integration Tests
+- Integration tests are located at MultiAnchorCommentIT.java in the test folder
+- These tests do the following:
+  - API coverage: Exercise the plugin REST endpoints for saving, listing, getting and deleting multi-anchor ranges.
+  - Storage validation: Verify MultiAnchorStorage persists ranges into refs/users and correctly wraps ref updates.
+  - AI integration (where present): Exercise AiReview client hooks to ensure graceful handling of AI review responses.
 
-> **TODO: INSERT** user testing summary from the final report.
->
-> Document: number of participants (3–5), task descriptions (2–4 tasks covering use cases from requirements), time bounds per task, observations and feedback summary, issues identified and suggestions for improvement, and any survey results.
+E2E: Added in the /plugins/multianchor_comment/e2e-tests directory
+- Scenario implementation: plugins/multianchor_comment/e2e-tests/src/test/scala/com/google/gerrit/scenarios/MultiAnchorRangesRest.scala
+- Data-driven inputs: …/MultiAnchorRangesRest.json and …/MultiAnchorRangesRest-body.json under src/test/resources/data/
+- Same package and base class pattern as e2e-tests/ (Gatling Simulation via GerritSimulation, httpProtocol, jsonFile(resource).convert(keys)).
+- Executed via plugins/multianchor_comment/e2e-tests/OVERLAY.txt
+
 
 ---
 
-## 9. Known Issues & Future Work
+## 8. Known Issues & Future Work
 
-### 9.1 Known Issues
+### 8.1 Known Issues
 
-**Stale current-revision caching:** The UI may cache the resolved patchset for "current" and continue to read/write plugin data against an older patchset until the page is reloaded. This can briefly misalign anchors with what the user sees as "latest" if a new patchset is uploaded while the diff view is open.
+**User confusion with native comments (reduced):** Multi-anchored comments use different shortcuts, semantics, and persistence mechanisms from Gerrit's native single-range comments. The addition of the User Manual mitigates this, but without further UI discoverability cues, this can still confuse reviewers unfamiliar with the plugin. The user's manual should be consulted for usage instructions.
+ 
+**AI-generated review quality inconsistency:** The usefulness of AI-generated multi-anchored comments depends on prompt quality and the external LLM response format. AI reviews may occasionally generate excessive comments, irrelevant suggestions, or malformed outputs. Prompt engineering improvements were added during Sprint 4 to encourage smaller-scoped comments, and defensive parsing logic was implemented to handle malformed AI responses. All AI-generated comments are stored as editable drafts, allowing reviewers to modify or discard suggestions before submission.
+ 
+**Gerrit upstream compatibility changes:** Because the plugin integrates deeply with Gerrit frontend rendering, REST APIs, and storage behavior, future Gerrit updates may introduce breaking changes to internal APIs, DOM structures, or plugin loading behavior. Automated Jest, integration, and Gatling tests provide regression coverage to quickly identify compatibility issues after upstream changes.
 
-**User confusion with native comments:** Multi-anchored comments use different shortcuts, semantics, and persistence mechanisms from Gerrit's native single-range comments. Without documentation or UI discoverability cues, this can confuse reviewers accustomed to native Gerrit commenting. The user's manual should be consulted for usage instructions.
 
-> **TODO: ADD** any additional known issues discovered during Sprint 4 or user testing.
+### 8.2 Resolved Issues
+ 
+**Stale current-revision caching:** Previously, the UI could cache the resolved patchset for "current" and read/write plugin data against an older patchset until reload. This was resolved by updated patchset feature fixes merged to main in Sprint 4.
 
-### 9.2 Unfinished Work in Progress
 
-> **TODO:** For any features that are incomplete at project end, describe:
->
-> - What it is
-> - Where the code lives (branch name, file paths)
-> - Current status (what works, what doesn't)
-> - Remaining tasks to complete it
-
-### 9.3 Future Work / Enhancement Opportunities
+### 8.3 Future Work / Enhancement Opportunities
 
 The following features were discussed during the project but not implemented due to time constraints:
-
+ 
 - **Comment navigation / overview panel:** A UI panel that lists all multi-anchored comments in a change and allows clicking to jump directly to the corresponding lines, even across files. This would address usability for large reviews.
-
 - **Enhanced visual indicators:** Iconography or badges on multi-anchored comments showing the number of anchored locations and their file paths, to distinguish them more clearly from standard comments in the comment thread.
-
 - **Automated anchor remapping:** When code referenced by a multi-anchored comment shifts due to edits in a subsequent patchset, automatically remap anchor line numbers rather than simply scoping to the original patchset. This is the "anchor drift" problem partially addressed by patchset-scoped storage but not fully solved with automatic remapping.
+- **Upstream contribution:** Packaging the plugin for submission to the Gerrit open-source project as a contributed plugin or proposing multi-anchor commenting as a core Gerrit feature. The client noted during the final presentation that this project originated from the official Gerrit page and that integration is a real possibility.
+- **Linter integration:** Adding a linter for internal code quality, both for the plugin codebase and potentially as a contribution to the native Gerrit codebase if pursuing upstream integration. This was raised during the final presentation as a good addition.
 
-- **Upstream contribution:** Packaging the plugin for submission to the Gerrit open-source project as a contributed plugin or proposing multi-anchor commenting as a core Gerrit feature.
