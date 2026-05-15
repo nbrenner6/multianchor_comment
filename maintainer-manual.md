@@ -143,8 +143,7 @@ Multi-anchor ranges are scoped to the patchset they were created on, handling an
 - If saving additional ranges fails after a draft is created, the draft is removed or the flow fails gracefully.
 - Deleting a multi-anchor draft cleans up plugin-stored ranges and surfaces partial failures in logs without breaking the user's discard flow.
 
-**Status:** Delivered (Sprint 3–4); core scoping logic delivered, edge case handling ongoing.
-
+**Status:** Delivered (Sprint 3–4); core scoping logic delivered
 ---
 
 ## 3. Architectural Diagrams
@@ -360,7 +359,7 @@ chmod 600 /tmp/gerrit-site/etc/secure.config
 
 The `chmod 600` ensures only the Gerrit process owner can read the key.
 
-**Step 4 — Rebuild and restart Gerrit** (see Sections 6.3 and 6.4).
+**Step 4 — Rebuild and restart Gerrit** (see Sections 5.3 and 5.4).
 
 **Step 5 — Verify:** Navigate to a diff view in Gerrit (open a change and click on a file). A blue "AI Review" button should appear in the bottom-right corner. Clicking it will generate draft comments after a few seconds.
 
